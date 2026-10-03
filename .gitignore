@@ -40,6 +40,6 @@ ENV/
 .coverage
 htmlcov/
 
-# Redis / Data
+# Redis
 dump.rdb
 data/
