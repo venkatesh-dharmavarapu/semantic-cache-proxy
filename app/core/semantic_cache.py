@@ -27,11 +27,11 @@ class SemanticCache:
         embedding_service: Optional[EmbeddingService] = None,
         similarity_threshold: Optional[float] = None,
     ):
-        self.store = vector_store or VectorStoreManager()
+        self.store = vector_store if vector_store is not None else VectorStoreManager()
         self.store.connect()
         self.store.create_index()
 
-        self.embedder = embedding_service or EmbeddingService()
+        self.embedder = embedding_service if embedding_service is not None else EmbeddingService()
         self.reader = CacheReader(self.store)
         self.writer = CacheWriter(self.store)
         self.similarity_threshold = (
@@ -41,7 +41,6 @@ class SemanticCache:
     def _extract_prompt_and_system(
         self, messages: List[Dict[str, str]]
     ) -> Tuple[str, str]:
-        """Separates system instructions from user/assistant conversation history."""
         system_prompts: List[str] = []
         conversation: List[str] = []
 
@@ -65,10 +64,6 @@ class SemanticCache:
         max_tokens: Optional[int] = None,
         similarity_threshold: Optional[float] = None,
     ) -> Tuple[CacheResult, List[float], str, str]:
-        """
-        Executes semantic lookup.
-        Returns: (CacheResult, vector, system_prompt_hash, params_hash)
-        """
         start_time = time.perf_counter()
         user_prompt, system_prompt = self._extract_prompt_and_system(messages)
 
@@ -78,11 +73,8 @@ class SemanticCache:
         )
 
         threshold = similarity_threshold or self.similarity_threshold
-
-        # Generate prompt embedding vector
         vector = await self.embedder.get_embedding(user_prompt)
 
-        # Check nearest neighbor in Redis
         match = self.reader.query_similarity(
             vector=vector,
             model=model,
@@ -133,7 +125,6 @@ class SemanticCache:
         params_hash: str,
         ttl_seconds: Optional[int] = None,
     ) -> str:
-        """Stores the miss result back into RedisVL index."""
         return self.writer.store_response(
             prompt=prompt,
             vector=vector,
