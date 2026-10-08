@@ -1,9 +1,10 @@
 import json
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import numpy as np
 from app.config import settings
 from app.core.vector_store import VectorStoreManager
+
 
 class CacheWriter:
     def __init__(self, vector_store: VectorStoreManager):
@@ -17,7 +18,7 @@ class CacheWriter:
         model: str,
         system_prompt_hash: str,
         params_hash: str,
-        ttl_seconds: int | None = None,
+        ttl_seconds: Optional[int] = None,
     ) -> str:
         """
         Stores prompt embedding and metadata payload in Redis.
@@ -25,10 +26,9 @@ class CacheWriter:
         """
         ttl = ttl_seconds or settings.DEFAULT_CACHE_TTL_SECONDS
         now = time.time()
-        
-        # RedisVL expects raw float32 bytes for vector fields
+
         vector_bytes = np.array(vector, dtype=np.float32).tobytes()
-        
+
         entry = {
             "prompt": prompt,
             "response_json": json.dumps(response_data),
@@ -40,11 +40,16 @@ class CacheWriter:
             "hit_count": 0,
             "prompt_vector": vector_bytes,
         }
-        
-        # Load into Redis index
+
+        # Ensure index exists and client is ready
+        self.store.connect()
+
+        # Load entry into RedisVL index
         keys = self.store.index.load([entry])
         entry_key = keys[0]
-        
-        # Set Redis native TTL key expiration as well
-        self.store.client.expire(entry_key, ttl)
+
+        # Set TTL key expiration via redis client
+        if self.store.client:
+            self.store.client.expire(entry_key, ttl)
+
         return entry_key
