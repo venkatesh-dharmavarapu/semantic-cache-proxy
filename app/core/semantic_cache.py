@@ -27,13 +27,18 @@ class SemanticCache:
         embedding_service: Optional[EmbeddingService] = None,
         similarity_threshold: Optional[float] = None,
     ):
-        self.store = vector_store if vector_store is not None else VectorStoreManager()
-        self.store.connect()
-        self.store.create_index()
+        # Named self.vector_store to avoid colliding with self.store() method
+        self.vector_store = (
+            vector_store if vector_store is not None else VectorStoreManager()
+        )
+        self.vector_store.connect()
+        self.vector_store.create_index()
 
-        self.embedder = embedding_service if embedding_service is not None else EmbeddingService()
-        self.reader = CacheReader(self.store)
-        self.writer = CacheWriter(self.store)
+        self.embedder = (
+            embedding_service if embedding_service is not None else EmbeddingService()
+        )
+        self.reader = CacheReader(self.vector_store)
+        self.writer = CacheWriter(self.vector_store)
         self.similarity_threshold = (
             similarity_threshold or settings.DEFAULT_SIMILARITY_THRESHOLD
         )
