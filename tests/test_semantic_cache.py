@@ -15,12 +15,13 @@ def mock_cache(monkeypatch):
     for key in store.client.scan_iter("cache:llm:*"):
         store.client.delete(key)
 
-    embedder = EmbeddingService(api_key="sk-test")
+    # Initialize without api_key for Ollama
+    embedder = EmbeddingService()
 
-    # Deterministic mock embedding based on query content
+    # 768-dimensional mock embedding for nomic-embed-text
     async def mock_embed(text: str):
         val = 0.1 if "python" in text.lower() else 0.8
-        return [val] * 1536
+        return [val] * 768
 
     monkeypatch.setattr(embedder, "get_embedding", mock_embed)
     cache = SemanticCache(
@@ -29,7 +30,6 @@ def mock_cache(monkeypatch):
 
     yield cache
 
-    # Cleanup after test finishes
     for key in store.client.scan_iter("cache:llm:*"):
         store.client.delete(key)
 
@@ -40,7 +40,7 @@ async def test_full_cache_lifecycle(mock_cache):
         {"role": "system", "content": "You are a code tutor."},
         {"role": "user", "content": "What is Python?"},
     ]
-    model = "gpt-4o"
+    model = "llama3.2:1b"
     temperature = 0.2
 
     # Step 1: Initial query must MISS
