@@ -1,10 +1,10 @@
-from typing import Dict, Any
+from typing import Any, Dict
+from app.config import settings
 
-# RedisVL index definition schema
 INDEX_SCHEMA: Dict[str, Any] = {
     "index": {
-        "name": "llm_semantic_cache",
-        "prefix": "cache:llm:",
+        "name": settings.CACHE_INDEX_NAME,
+        "prefix": settings.CACHE_PREFIX,
         "storage_type": "hash",
     },
     "fields": [
@@ -20,13 +20,13 @@ INDEX_SCHEMA: Dict[str, Any] = {
             "name": "prompt_vector",
             "type": "vector",
             "attrs": {
-                "dims": 1536,
+                "dims": settings.EMBEDDING_DIM,
                 "distance_metric": "cosine",
                 "algorithm": "hnsw",
                 "datatype": "float32",
                 "m": 16,
                 "ef_construction": 200,
-                "ef_runtime": 10
+                "ef_runtime": 10,
             },
         },
     ],
