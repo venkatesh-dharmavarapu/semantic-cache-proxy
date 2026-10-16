@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from app.api.analytics import router as analytics_router
 from app.api.proxy import router as proxy_router
 from app.config import settings
 
@@ -9,6 +10,7 @@ app = FastAPI(
 )
 
 app.include_router(proxy_router)
+app.include_router(analytics_router)
 
 
 @app.get("/health")
