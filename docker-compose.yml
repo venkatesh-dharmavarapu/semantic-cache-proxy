@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  redis-stack:
+    image: redis/redis-stack:latest
+    container_name: redis-stack
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+      - "8001:8001"
+    volumes:
+      - redis_data:/data
+
+  proxy-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: semantic-cache-proxy
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis-stack:6379
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - EMBEDDING_MODEL=nomic-embed-text
+      - EMBEDDING_DIM=768
+      - DEFAULT_LLM_MODEL=llama3.2:1b
+      - DEFAULT_SIMILARITY_THRESHOLD=0.88
+    depends_on:
+      - redis-stack
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  redis_data:
