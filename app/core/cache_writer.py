@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 import numpy as np
 from app.config import settings
 from app.core.vector_store import VectorStoreManager
@@ -18,12 +18,9 @@ class CacheWriter:
         model: str,
         system_prompt_hash: str,
         params_hash: str,
+        context_hash: str = "stateless",
         ttl_seconds: Optional[int] = None,
     ) -> str:
-        """
-        Stores prompt embedding and metadata payload in Redis.
-        Returns the created entry key.
-        """
         ttl = ttl_seconds or settings.DEFAULT_CACHE_TTL_SECONDS
         now = time.time()
 
@@ -35,20 +32,17 @@ class CacheWriter:
             "model": model,
             "system_prompt_hash": system_prompt_hash,
             "params_hash": params_hash,
+            "context_hash": context_hash,
             "created_at": now,
             "ttl": ttl,
             "hit_count": 0,
             "prompt_vector": vector_bytes,
         }
 
-        # Ensure index exists and client is ready
         self.store.connect()
-
-        # Load entry into RedisVL index
         keys = self.store.index.load([entry])
         entry_key = keys[0]
 
-        # Set TTL key expiration via redis client
         if self.store.client:
             self.store.client.expire(entry_key, ttl)
 
