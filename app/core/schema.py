@@ -13,6 +13,7 @@ INDEX_SCHEMA: Dict[str, Any] = {
         {"name": "model", "type": "tag"},
         {"name": "system_prompt_hash", "type": "tag"},
         {"name": "params_hash", "type": "tag"},
+        {"name": "context_hash", "type": "tag"},
         {"name": "created_at", "type": "numeric"},
         {"name": "ttl", "type": "numeric"},
         {"name": "hit_count", "type": "numeric"},
