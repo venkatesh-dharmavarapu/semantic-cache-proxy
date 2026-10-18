@@ -1,9 +1,13 @@
 import json
-from typing import Dict, Any, Optional, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from redisvl.query import VectorQuery
-from redisvl.query.filter import Tag
+from app.config import settings
 from app.core.vector_store import VectorStoreManager
+
+logger = logging.getLogger(__name__)
+
 
 class CacheReader:
     def __init__(self, vector_store: VectorStoreManager):
@@ -11,52 +15,62 @@ class CacheReader:
 
     def query_similarity(
         self,
-        vector: list[float],
+        vector: List[float],
         model: str,
         system_prompt_hash: str,
         params_hash: str,
-        similarity_threshold: float = 0.95,
+        context_hash: str = "stateless",
+        similarity_threshold: Optional[float] = None,
+        top_k: int = 1,
     ) -> Optional[Tuple[Dict[str, Any], float, str]]:
         """
-        Searches nearest neighbor vector with cosine distance.
-        Redis cosine distance: similarity = 1 - vector_distance.
-        
-        Returns:
-            (cached_response_dict, similarity_score, key) if hit, else None.
+        Queries Redis HNSW vector index for nearest semantic neighbors matching
+        exact partition hashes.
         """
-        # Strict partition matching on model, system prompt, and parameters
-        filter_expr = (
-            (Tag("model") == model) &
-            (Tag("system_prompt_hash") == system_prompt_hash) &
-            (Tag("params_hash") == params_hash)
-        )
-        
+        threshold = similarity_threshold or settings.DEFAULT_SIMILARITY_THRESHOLD
         vector_bytes = np.array(vector, dtype=np.float32).tobytes()
-        
-        v_query = VectorQuery(
+
+        # Build filter query for deterministic partitions
+        filter_expression = (
+            f"(@model:{{{model}}}) & "
+            f"(@system_prompt_hash:{{{system_prompt_hash}}}) & "
+            f"(@params_hash:{{{params_hash}}}) & "
+            f"(@context_hash:{{{context_hash}}})"
+        )
+
+        query = VectorQuery(
             vector=vector_bytes,
             vector_field_name="prompt_vector",
             return_fields=["prompt", "response_json", "vector_distance", "hit_count"],
-            filter_expression=filter_expr,
-            num_results=1,
-            return_score=True
+            filter_expression=filter_expression,
+            num_results=top_k,
         )
-        
-        results = self.store.index.query(v_query)
-        
-        if not results:
+
+        try:
+            results = self.store.index.query(query)
+            if not results:
+                return None
+
+            top_result = results[0]
+            vector_distance = float(top_result.get("vector_distance", 1.0))
+            similarity_score = 1.0 - vector_distance
+
+            if similarity_score >= threshold:
+                response_json = json.loads(top_result["response_json"])
+                entry_key = top_result["id"]
+                return response_json, similarity_score, entry_key
+
             return None
-        
-        match = results[0]
-        # RedisVL returns vector_distance. For cosine distance:
-        distance = float(match.get("vector_distance", 1.0))
-        similarity = 1.0 - distance
-        
-        if similarity >= similarity_threshold:
-            # Increment hit counter for telemetry
-            key = match["id"]
-            self.store.client.hincrby(key, "hit_count", 1)
-            response_json = json.loads(match["response_json"])
-            return response_json, similarity, key
-            
-        return None
+        except Exception as e:
+            logger.warning("Error querying vector index: %s", e)
+            return None
+
+    def extend_key_ttl(self, entry_key: str, extension_seconds: int = 86400):
+        """Applies adaptive sliding TTL extension upon cache hit."""
+        try:
+            if self.store.client:
+                # Increment hit count and reset TTL window
+                self.store.client.hincrby(entry_key, "hit_count", 1)
+                self.store.client.expire(entry_key, extension_seconds)
+        except Exception as e:
+            logger.warning("Failed to extend TTL for %s: %s", entry_key, e)
