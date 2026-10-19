@@ -11,14 +11,11 @@ def mock_cache(monkeypatch):
     store.connect()
     store.create_index()
 
-    # Clean existing test entries to prevent state leakage between runs
     for key in store.client.scan_iter("cache:llm:*"):
         store.client.delete(key)
 
-    # Initialize without api_key for Ollama
     embedder = EmbeddingService()
 
-    # 768-dimensional mock embedding for nomic-embed-text
     async def mock_embed(text: str):
         val = 0.1 if "python" in text.lower() else 0.8
         return [val] * 768
@@ -43,8 +40,8 @@ async def test_full_cache_lifecycle(mock_cache):
     model = "llama3.2:1b"
     temperature = 0.2
 
-    # Step 1: Initial query must MISS
-    res, vector, sys_hash, p_hash = await mock_cache.lookup(
+    # Step 1: Initial query must MISS (unpack 5 values)
+    res, vector, sys_hash, p_hash, c_hash = await mock_cache.lookup(
         messages=messages, model=model, temperature=temperature
     )
     assert res.is_hit is False
@@ -69,11 +66,12 @@ async def test_full_cache_lifecycle(mock_cache):
         model=model,
         system_prompt_hash=sys_hash,
         params_hash=p_hash,
+        context_hash=c_hash,
     )
     assert key.startswith("cache:llm:")
 
     # Step 3: Identical query must now HIT
-    res2, _, _, _ = await mock_cache.lookup(
+    res2, _, _, _, _ = await mock_cache.lookup(
         messages=messages, model=model, temperature=temperature
     )
     assert res2.is_hit is True
@@ -85,7 +83,7 @@ async def test_full_cache_lifecycle(mock_cache):
     assert res2.lookup_latency_ms < 50.0
 
     # Step 4: Different temperature parameter must MISS
-    res3, _, _, _ = await mock_cache.lookup(
+    res3, _, _, _, _ = await mock_cache.lookup(
         messages=messages, model=model, temperature=0.9
     )
     assert res3.is_hit is False
