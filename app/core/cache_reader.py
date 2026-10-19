@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from redisvl.query import VectorQuery
@@ -7,6 +8,12 @@ from app.config import settings
 from app.core.vector_store import VectorStoreManager
 
 logger = logging.getLogger(__name__)
+
+
+def escape_redis_tag(val: str) -> str:
+    """Escapes punctuation characters for RediSearch tag filters."""
+    # Characters: , . < > { } [ ] " ' : ; ! @ # $ % ^ & * ( ) - + = ~ | / \
+    return re.sub(r"([,.<>{}\[\]\"':;!@#$%^&*()\-+=~|/\\?])", r"\\\1", val)
 
 
 class CacheReader:
@@ -23,19 +30,20 @@ class CacheReader:
         similarity_threshold: Optional[float] = None,
         top_k: int = 1,
     ) -> Optional[Tuple[Dict[str, Any], float, str]]:
-        """
-        Queries Redis HNSW vector index for nearest semantic neighbors matching
-        exact partition hashes.
-        """
         threshold = similarity_threshold or settings.DEFAULT_SIMILARITY_THRESHOLD
         vector_bytes = np.array(vector, dtype=np.float32).tobytes()
 
-        # Build filter query for deterministic partitions
+        # Escape special punctuation like ':' and '.' in model tag names
+        clean_model = escape_redis_tag(model)
+        clean_sys = escape_redis_tag(system_prompt_hash)
+        clean_params = escape_redis_tag(params_hash)
+        clean_ctx = escape_redis_tag(context_hash)
+
         filter_expression = (
-            f"(@model:{{{model}}}) & "
-            f"(@system_prompt_hash:{{{system_prompt_hash}}}) & "
-            f"(@params_hash:{{{params_hash}}}) & "
-            f"(@context_hash:{{{context_hash}}})"
+            f"(@model:{{{clean_model}}}) & "
+            f"(@system_prompt_hash:{{{clean_sys}}}) & "
+            f"(@params_hash:{{{clean_params}}}) & "
+            f"(@context_hash:{{{clean_ctx}}})"
         )
 
         query = VectorQuery(
@@ -66,10 +74,8 @@ class CacheReader:
             return None
 
     def extend_key_ttl(self, entry_key: str, extension_seconds: int = 86400):
-        """Applies adaptive sliding TTL extension upon cache hit."""
         try:
             if self.store.client:
-                # Increment hit count and reset TTL window
                 self.store.client.hincrby(entry_key, "hit_count", 1)
                 self.store.client.expire(entry_key, extension_seconds)
         except Exception as e:
