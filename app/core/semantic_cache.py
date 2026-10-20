@@ -27,7 +27,6 @@ class SemanticCache:
         embedding_service: Optional[EmbeddingService] = None,
         similarity_threshold: Optional[float] = None,
     ):
-        # Named self.vector_store to avoid colliding with self.store() method
         self.vector_store = (
             vector_store if vector_store is not None else VectorStoreManager()
         )
@@ -47,18 +46,17 @@ class SemanticCache:
         self, messages: List[Dict[str, str]]
     ) -> Tuple[str, str]:
         system_prompts: List[str] = []
-        conversation: List[str] = []
+        user_query = ""
 
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if role == "system":
                 system_prompts.append(content)
-            else:
-                conversation.append(f"{role}: {content}")
+            elif role == "user":
+                user_query = content
 
         system_text = "\n".join(system_prompts)
-        user_query = conversation[-1] if conversation else ""
         return user_query, system_text
 
     async def lookup(
@@ -68,7 +66,7 @@ class SemanticCache:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         similarity_threshold: Optional[float] = None,
-    ) -> Tuple[CacheResult, List[float], str, str]:
+    ) -> Tuple[CacheResult, List[float], str, str, str]:
         start_time = time.perf_counter()
         user_prompt, system_prompt = self._extract_prompt_and_system(messages)
 
@@ -76,6 +74,7 @@ class SemanticCache:
         p_hash = CacheKeyHasher.hash_generation_params(
             model=model, temperature=temperature, max_tokens=max_tokens
         )
+        c_hash = CacheKeyHasher.hash_conversation_context(messages)
 
         threshold = similarity_threshold or self.similarity_threshold
         vector = await self.embedder.get_embedding(user_prompt)
@@ -85,6 +84,7 @@ class SemanticCache:
             model=model,
             system_prompt_hash=sys_hash,
             params_hash=p_hash,
+            context_hash=c_hash,
             similarity_threshold=threshold,
         )
 
@@ -92,6 +92,8 @@ class SemanticCache:
 
         if match:
             response_json, similarity, key = match
+            # Extend TTL dynamically on hit
+            self.reader.extend_key_ttl(key)
             return (
                 CacheResult(
                     is_hit=True,
@@ -104,6 +106,7 @@ class SemanticCache:
                 vector,
                 sys_hash,
                 p_hash,
+                c_hash,
             )
 
         return (
@@ -118,6 +121,7 @@ class SemanticCache:
             vector,
             sys_hash,
             p_hash,
+            c_hash,
         )
 
     def store(
@@ -128,6 +132,7 @@ class SemanticCache:
         model: str,
         system_prompt_hash: str,
         params_hash: str,
+        context_hash: str = "stateless",
         ttl_seconds: Optional[int] = None,
     ) -> str:
         return self.writer.store_response(
@@ -137,5 +142,6 @@ class SemanticCache:
             model=model,
             system_prompt_hash=system_prompt_hash,
             params_hash=params_hash,
+            context_hash=context_hash,
             ttl_seconds=ttl_seconds,
         )
