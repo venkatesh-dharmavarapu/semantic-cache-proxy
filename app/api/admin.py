@@ -1,8 +1,22 @@
 from typing import Optional
 from fastapi import APIRouter, Query, Response, status
 from app.api.proxy import cache
+from app.schemas.warming_models import CacheWarmRequest, CacheWarmResponse
+from app.services.warmer import CacheWarmer
 
 router = APIRouter(prefix="/v1/cache", tags=["Cache Administration"])
+warmer = CacheWarmer(cache)
+
+
+@router.post("/warm", response_model=CacheWarmResponse, status_code=status.HTTP_200_OK)
+async def warm_cache(request: CacheWarmRequest):
+    """Pre-seeds the Redis semantic cache with batches of high-frequency prompts."""
+    successes, failures = await warmer.warm_batch(request)
+    return CacheWarmResponse(
+        total_submitted=len(request.items),
+        successfully_warmed=successes,
+        failures=failures,
+    )
 
 
 @router.delete("/purge", status_code=status.HTTP_200_OK)
@@ -28,7 +42,6 @@ def purge_cache(
         }
 
     if model:
-        # Scan and verify model match
         for key in client.scan_iter("cache:llm:*"):
             stored_model = client.hget(key, "model")
             if stored_model and stored_model.decode("utf-8") == model:
