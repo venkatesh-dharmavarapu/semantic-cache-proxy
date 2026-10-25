@@ -27,3 +27,22 @@ class UpstreamTimeoutError(HTTPException):
                 }
             },
         )
+
+
+class RateLimitExceededError(HTTPException):
+    def __init__(self, retry_after: int, limit: int):
+        super().__init__(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": {
+                    "message": f"Rate limit exceeded. Maximum {limit} requests per minute allowed.",
+                    "type": "rate_limit_exceeded",
+                    "code": 429,
+                }
+            },
+            headers={
+                "Retry-After": str(retry_after),
+                "X-RateLimit-Limit": str(limit),
+                "X-RateLimit-Remaining": "0",
+            },
+        )
