@@ -1,10 +1,12 @@
 import time
-from fastapi import APIRouter, Header, Response
+from fastapi import APIRouter, Header, Request, Response
 from fastapi.responses import StreamingResponse
+from app.core.exceptions import RateLimitExceededError
+from app.core.rate_limiter import SlidingWindowRateLimiter
 from app.core.semantic_cache import SemanticCache
 from app.core.streaming import StreamingUtils
 from app.core.telemetry import TelemetryTracker
-from app.schemas.chat_models import ChatCompletionRequest, ChatCompletionResponse
+from app.schemas.chat_models import ChatCompletionRequest
 from app.services.llm_client import LLMClient
 
 router = APIRouter(prefix="/v1", tags=["Chat Proxy"])
@@ -12,19 +14,38 @@ router = APIRouter(prefix="/v1", tags=["Chat Proxy"])
 cache = SemanticCache()
 llm_client = LLMClient()
 telemetry = TelemetryTracker()
+rate_limiter = SlidingWindowRateLimiter(default_limit=60, window_seconds=60)
 
 
 @router.post("/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
+    req: Request,
     response: Response,
     x_cache_bypass: bool = Header(default=False),
     x_similarity_threshold: float | None = Header(default=None),
 ):
+    # Determine client IP for throttling
+    client_ip = (
+        req.headers.get("x-forwarded-for")
+        or (req.client.host if req.client else "127.0.0.1")
+    )
+
+    # 1. Evaluate rate limiter
+    allowed, remaining, retry_after = rate_limiter.check_rate_limit(client_ip)
+    if not allowed:
+        raise RateLimitExceededError(
+            retry_after=retry_after, limit=rate_limiter.default_limit
+        )
+
+    # Set rate limit tracking headers
+    response.headers["X-RateLimit-Limit"] = str(rate_limiter.default_limit)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+
     serialized_messages = [msg.model_dump() for msg in request.messages]
     user_prompt = serialized_messages[-1]["content"] if serialized_messages else ""
 
-    # 1. Handle Explicit Cache Bypass
+    # 2. Handle Explicit Cache Bypass
     if x_cache_bypass:
         telemetry.record_bypass()
         payload = request.model_dump(exclude_none=True)
@@ -42,6 +63,8 @@ async def chat_completions(
                     "X-Cache-Lookup": "BYPASS",
                     "X-Cache-Similarity": "0.0",
                     "X-Lookup-Latency-ms": "0.00",
+                    "X-RateLimit-Limit": str(rate_limiter.default_limit),
+                    "X-RateLimit-Remaining": str(remaining),
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                 },
@@ -53,7 +76,7 @@ async def chat_completions(
         response.headers["X-Lookup-Latency-ms"] = "0.00"
         return raw_response
 
-    # 2. Check Semantic Cache
+    # 3. Check Semantic Cache
     cache_result, vector, sys_hash, p_hash, c_hash = await cache.lookup(
         messages=serialized_messages,
         model=request.model,
@@ -62,7 +85,7 @@ async def chat_completions(
         similarity_threshold=x_similarity_threshold,
     )
 
-    # 3. Cache HIT
+    # 4. Cache HIT
     if cache_result.is_hit and cache_result.response_data:
         telemetry.record_hit(latency_ms=cache_result.lookup_latency_ms)
 
@@ -77,6 +100,8 @@ async def chat_completions(
                     "X-Cache-Lookup": "HIT",
                     "X-Cache-Similarity": f"{cache_result.similarity_score:.4f}",
                     "X-Lookup-Latency-ms": f"{cache_result.lookup_latency_ms:.2f}",
+                    "X-RateLimit-Limit": str(rate_limiter.default_limit),
+                    "X-RateLimit-Remaining": str(remaining),
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                 },
@@ -87,7 +112,7 @@ async def chat_completions(
         response.headers["X-Lookup-Latency-ms"] = f"{cache_result.lookup_latency_ms:.2f}"
         return cache_result.response_data
 
-    # 4. Cache MISS: Handle Streaming vs Non-Streaming
+    # 5. Cache MISS: Handle Streaming vs Non-Streaming
     payload = request.model_dump(exclude_none=True)
 
     if request.stream:
@@ -101,7 +126,6 @@ async def chat_completions(
                 if full_payload:
                     assembled_data = full_payload
 
-            # Save full assembled response into Redis vector store
             if assembled_data:
                 cache.store(
                     prompt=user_prompt,
@@ -120,6 +144,8 @@ async def chat_completions(
                 "X-Cache-Lookup": "MISS",
                 "X-Cache-Similarity": "0.0",
                 "X-Lookup-Latency-ms": f"{cache_result.lookup_latency_ms:.2f}",
+                "X-RateLimit-Limit": str(rate_limiter.default_limit),
+                "X-RateLimit-Remaining": str(remaining),
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
             },
