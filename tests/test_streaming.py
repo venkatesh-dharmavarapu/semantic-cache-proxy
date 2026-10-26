@@ -7,22 +7,25 @@ from app.api.proxy import cache, llm_client
 
 @pytest.fixture(autouse=True)
 def clean_redis_keys():
-    for key in cache.vector_store.client.scan_iter("cache:llm:*"):
-        cache.vector_store.client.delete(key)
+    client = cache.vector_store.client
+    for key in client.scan_iter("cache:llm:*"):
+        client.delete(key)
+    for key in client.scan_iter("ratelimit:*"):
+        client.delete(key)
     yield
-    for key in cache.vector_store.client.scan_iter("cache:llm:*"):
-        cache.vector_store.client.delete(key)
+    for key in client.scan_iter("cache:llm:*"):
+        client.delete(key)
+    for key in client.scan_iter("ratelimit:*"):
+        client.delete(key)
 
 
 @pytest.mark.asyncio
 async def test_streaming_cache_lifecycle(monkeypatch):
-    # Mock embedding
     async def mock_embed(text: str):
         return [0.05] * 768
 
     monkeypatch.setattr(cache.embedder, "get_embedding", mock_embed)
 
-    # Mock streaming generator from upstream Ollama
     async def mock_stream_chat(payload):
         chunks = ["Streaming ", "answers ", "from ", "local ", "Ollama."]
         for token in chunks:
@@ -37,7 +40,6 @@ async def test_streaming_cache_lifecycle(monkeypatch):
 
         yield "data: [DONE]\n\n", None
 
-        # Terminal emission with assembled payload
         full_payload = {
             "id": "chatcmpl-stream-test",
             "object": "chat.completion",
