@@ -19,6 +19,35 @@ async def warm_cache(request: CacheWarmRequest):
     )
 
 
+@router.get("/clusters", status_code=status.HTTP_200_OK)
+def get_cluster_stats():
+    """Inspects cluster density, aliased prompts, and vector index memory distribution."""
+    client = cache.vector_store.client
+    if not client:
+        return {"status": "error", "message": "Vector store client not connected"}
+
+    total_keys = 0
+    total_aliases = 0
+    models_breakdown = {}
+
+    for key in client.scan_iter("cache:llm:*"):
+        total_keys += 1
+        data = client.hmget(key, ["model", "alias_count", "hit_count"])
+        model_name = data[0].decode("utf-8") if data[0] else "unknown"
+        alias_cnt = int(data[1]) if data[1] else 0
+
+        total_aliases += alias_cnt
+        models_breakdown[model_name] = models_breakdown.get(model_name, 0) + 1
+
+    return {
+        "status": "success",
+        "total_clusters": total_keys,
+        "consolidated_aliases": total_aliases,
+        "total_prompts_servable": total_keys + total_aliases,
+        "models": models_breakdown,
+    }
+
+
 @router.delete("/purge", status_code=status.HTTP_200_OK)
 def purge_cache(
     model: Optional[str] = Query(default=None, description="Purge entries strictly for a model tag"),
