@@ -46,3 +46,17 @@ class RateLimitExceededError(HTTPException):
                 "X-RateLimit-Remaining": "0",
             },
         )
+
+
+class TenantBudgetExceededError(HTTPException):
+    def __init__(self, tenant_id: str, current_used: int, max_tokens: int):
+        super().__init__(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": {
+                    "message": f"Token budget exceeded for tenant '{tenant_id}'. Used {current_used}/{max_tokens} tokens.",
+                    "type": "budget_exceeded_error",
+                    "code": 402,
+                }
+            },
+        )
