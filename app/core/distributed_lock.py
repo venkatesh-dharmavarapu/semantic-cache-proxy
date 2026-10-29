@@ -1,7 +1,7 @@
 import asyncio
 import time
 import uuid
-from typing import Optional
+from typing import Optional, Tuple
 from app.core.vector_store import VectorStoreManager
 
 
@@ -10,26 +10,37 @@ class DistributedCacheLock:
         self.store = vector_store
         self.lock_ttl_ms = lock_ttl_ms
 
-    async def acquire_lock(self, lock_key: str, poll_interval: float = 0.05, timeout_s: float = 5.0) -> Optional[str]:
+    async def acquire_lock(
+        self, lock_key: str, poll_interval: float = 0.05, timeout_s: float = 5.0
+    ) -> Tuple[bool, Optional[str]]:
         """
         Attempts to acquire a distributed lock.
-        Returns lock token if acquired, or waits and returns None if released by another worker.
+        Returns:
+            (is_leader: bool, lock_token: Optional[str])
+            - (True, token): Primary worker responsible for executing upstream.
+            - (False, None): Follower that waited while leader populated the cache.
         """
         token = str(uuid.uuid4())
         client = self.store.client
         if not client:
-            return token
+            return True, token
 
         full_key = f"lock:upstream:{lock_key}"
+
+        # 1. Immediate acquisition attempt (The Leader)
+        acquired = client.set(full_key, token, nx=True, px=self.lock_ttl_ms)
+        if acquired:
+            return True, token
+
+        # 2. Sibling coroutines wait for the leader to complete and release the lock
         deadline = time.time() + timeout_s
-
         while time.time() < deadline:
-            acquired = client.set(full_key, token, nx=True, px=self.lock_ttl_ms)
-            if acquired:
-                return token
             await asyncio.sleep(poll_interval)
+            # When the key no longer exists, the leader has finished and released
+            if not client.exists(full_key):
+                return False, None
 
-        return None
+        return False, None
 
     def release_lock(self, lock_key: str, token: Optional[str]):
         """Releases the distributed lock using a Lua script to ensure safe token ownership."""
