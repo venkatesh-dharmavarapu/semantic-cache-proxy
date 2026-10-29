@@ -113,14 +113,14 @@ async def chat_completions(
         response.headers["X-Lookup-Latency-ms"] = f"{cache_result.lookup_latency_ms:.2f}"
         return cache_result.response_data
 
-    # 5. Cache MISS with Anti-Stampede Barrier
+# 5. Cache MISS with Anti-Stampede Barrier
     payload = request.model_dump(exclude_none=True)
     stampede_key = f"{p_hash}:{sys_hash}"
-    lock_token = await cache_lock.acquire_lock(stampede_key)
+    is_leader, lock_token = await cache_lock.acquire_lock(stampede_key)
 
     try:
-        # If lock wasn't acquired immediately, sibling worker may have just populated cache
-        if not lock_token:
+        # If not the leader, wait was completed — check cache again for leader's result
+        if not is_leader:
             retry_hit, _, _, _, _ = await cache.lookup(
                 messages=serialized_messages,
                 model=request.model,
@@ -129,6 +129,25 @@ async def chat_completions(
                 similarity_threshold=x_similarity_threshold,
             )
             if retry_hit.is_hit and retry_hit.response_data:
+                telemetry.record_hit(latency_ms=retry_hit.lookup_latency_ms)
+                if request.stream:
+                    return StreamingResponse(
+                        StreamingUtils.replay_cached_stream(
+                            cached_response=retry_hit.response_data,
+                            model=request.model,
+                        ),
+                        media_type="text/event-stream",
+                        headers={
+                            "X-Cache-Lookup": "HIT",
+                            "X-Cache-Similarity": f"{retry_hit.similarity_score:.4f}",
+                            "X-Lookup-Latency-ms": f"{retry_hit.lookup_latency_ms:.2f}",
+                            "X-RateLimit-Limit": str(rate_limiter.default_limit),
+                            "X-RateLimit-Remaining": str(remaining),
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                        },
+                    )
+
                 response.headers["X-Cache-Lookup"] = "HIT"
                 response.headers["X-Cache-Similarity"] = f"{retry_hit.similarity_score:.4f}"
                 response.headers["X-Lookup-Latency-ms"] = f"{retry_hit.lookup_latency_ms:.2f}"
@@ -195,4 +214,5 @@ async def chat_completions(
         response.headers["X-Lookup-Latency-ms"] = f"{cache_result.lookup_latency_ms:.2f}"
         return raw_response
     finally:
-        cache_lock.release_lock(stampede_key, lock_token)
+        if is_leader and lock_token:
+            cache_lock.release_lock(stampede_key, lock_token)
