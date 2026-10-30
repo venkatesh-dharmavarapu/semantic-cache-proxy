@@ -2,9 +2,12 @@ import time
 from fastapi import APIRouter, Header, Request, Response
 from fastapi.responses import StreamingResponse
 from app.core.distributed_lock import DistributedCacheLock
+from app.core.exact_cache import ExactMatchCache
 from app.core.exceptions import RateLimitExceededError
+from app.core.hasher import CacheKeyHasher
 from app.core.negative_cache import NegativeCachePolicy
 from app.core.rate_limiter import SlidingWindowRateLimiter
+from app.core.security_guardrail import CacheSecurityGuardrail
 from app.core.semantic_cache import SemanticCache
 from app.core.streaming import StreamingUtils
 from app.core.telemetry import TelemetryTracker
@@ -14,6 +17,7 @@ from app.services.llm_client import LLMClient
 router = APIRouter(prefix="/v1", tags=["Chat Proxy"])
 
 cache = SemanticCache()
+exact_cache = ExactMatchCache(cache.vector_store)
 llm_client = LLMClient()
 telemetry = TelemetryTracker()
 rate_limiter = SlidingWindowRateLimiter(default_limit=60, window_seconds=60)
@@ -33,7 +37,7 @@ async def chat_completions(
         or (req.client.host if req.client else "127.0.0.1")
     )
 
-    # 1. Evaluate rate limiter
+    # 1. Rate limiter check
     allowed, remaining, retry_after = rate_limiter.check_rate_limit(client_ip)
     if not allowed:
         raise RateLimitExceededError(
@@ -44,7 +48,13 @@ async def chat_completions(
     response.headers["X-RateLimit-Remaining"] = str(remaining)
 
     serialized_messages = [msg.model_dump() for msg in request.messages]
-    user_prompt = serialized_messages[-1]["content"] if serialized_messages else ""
+    user_prompt, system_prompt = cache._extract_prompt_and_system(serialized_messages)
+
+    sys_hash = CacheKeyHasher.hash_system_prompt(system_prompt)
+    p_hash = CacheKeyHasher.hash_generation_params(
+        model=request.model, temperature=request.temperature, max_tokens=request.max_tokens
+    )
+    c_hash = CacheKeyHasher.hash_conversation_context(serialized_messages)
 
     # 2. Handle Explicit Cache Bypass
     if x_cache_bypass:
@@ -62,6 +72,7 @@ async def chat_completions(
                 media_type="text/event-stream",
                 headers={
                     "X-Cache-Lookup": "BYPASS",
+                    "X-Cache-Tier": "NONE",
                     "X-Cache-Similarity": "0.0",
                     "X-Lookup-Latency-ms": "0.00",
                     "X-RateLimit-Limit": str(rate_limiter.default_limit),
@@ -73,12 +84,51 @@ async def chat_completions(
 
         raw_response = await llm_client.forward_chat_completion(payload)
         response.headers["X-Cache-Lookup"] = "BYPASS"
+        response.headers["X-Cache-Tier"] = "NONE"
         response.headers["X-Cache-Similarity"] = "0.0"
         response.headers["X-Lookup-Latency-ms"] = "0.00"
         return raw_response
 
-    # 3. Check Semantic Cache
-    cache_result, vector, sys_hash, p_hash, c_hash = await cache.lookup(
+    # 3. L1 EXACT-MATCH FAST PATH (Zero Embedding Generation Overhead)
+    exact_key = ExactMatchCache.generate_exact_key(
+        prompt=user_prompt,
+        model=request.model,
+        system_prompt_hash=sys_hash,
+        params_hash=p_hash,
+        context_hash=c_hash,
+    )
+    t_start = time.perf_counter()
+    l1_cached = exact_cache.lookup(exact_key)
+    l1_latency = (time.perf_counter() - t_start) * 1000.0
+
+    if l1_cached:
+        telemetry.record_hit(latency_ms=l1_latency)
+        if request.stream:
+            return StreamingResponse(
+                StreamingUtils.replay_cached_stream(
+                    cached_response=l1_cached, model=request.model
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "X-Cache-Lookup": "HIT",
+                    "X-Cache-Tier": "L1-EXACT",
+                    "X-Cache-Similarity": "1.0000",
+                    "X-Lookup-Latency-ms": f"{l1_latency:.2f}",
+                    "X-RateLimit-Limit": str(rate_limiter.default_limit),
+                    "X-RateLimit-Remaining": str(remaining),
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+
+        response.headers["X-Cache-Lookup"] = "HIT"
+        response.headers["X-Cache-Tier"] = "L1-EXACT"
+        response.headers["X-Cache-Similarity"] = "1.0000"
+        response.headers["X-Lookup-Latency-ms"] = f"{l1_latency:.2f}"
+        return l1_cached
+
+    # 4. L2 SEMANTIC VECTOR CACHE (HNSW Nearest Neighbors)
+    cache_result, vector, _, _, _ = await cache.lookup(
         messages=serialized_messages,
         model=request.model,
         temperature=request.temperature,
@@ -86,9 +136,10 @@ async def chat_completions(
         similarity_threshold=x_similarity_threshold,
     )
 
-    # 4. Cache HIT
     if cache_result.is_hit and cache_result.response_data:
         telemetry.record_hit(latency_ms=cache_result.lookup_latency_ms)
+        # Hydrate L1 exact cache for subsequent identical requests
+        exact_cache.store(exact_key, cache_result.response_data)
 
         if request.stream:
             return StreamingResponse(
@@ -99,6 +150,7 @@ async def chat_completions(
                 media_type="text/event-stream",
                 headers={
                     "X-Cache-Lookup": "HIT",
+                    "X-Cache-Tier": "L2-SEMANTIC",
                     "X-Cache-Similarity": f"{cache_result.similarity_score:.4f}",
                     "X-Lookup-Latency-ms": f"{cache_result.lookup_latency_ms:.2f}",
                     "X-RateLimit-Limit": str(rate_limiter.default_limit),
@@ -109,18 +161,27 @@ async def chat_completions(
             )
 
         response.headers["X-Cache-Lookup"] = "HIT"
+        response.headers["X-Cache-Tier"] = "L2-SEMANTIC"
         response.headers["X-Cache-Similarity"] = f"{cache_result.similarity_score:.4f}"
         response.headers["X-Lookup-Latency-ms"] = f"{cache_result.lookup_latency_ms:.2f}"
         return cache_result.response_data
 
-# 5. Cache MISS with Anti-Stampede Barrier
+    # 5. CACHE MISS with Anti-Stampede Barrier
     payload = request.model_dump(exclude_none=True)
     stampede_key = f"{p_hash}:{sys_hash}"
     is_leader, lock_token = await cache_lock.acquire_lock(stampede_key)
 
     try:
-        # If not the leader, wait was completed — check cache again for leader's result
         if not is_leader:
+            # Recheck L1 & L2 after follower wait
+            retry_l1 = exact_cache.lookup(exact_key)
+            if retry_l1:
+                response.headers["X-Cache-Lookup"] = "HIT"
+                response.headers["X-Cache-Tier"] = "L1-EXACT"
+                response.headers["X-Cache-Similarity"] = "1.0000"
+                response.headers["X-Lookup-Latency-ms"] = "1.00"
+                return retry_l1
+
             retry_hit, _, _, _, _ = await cache.lookup(
                 messages=serialized_messages,
                 model=request.model,
@@ -130,25 +191,8 @@ async def chat_completions(
             )
             if retry_hit.is_hit and retry_hit.response_data:
                 telemetry.record_hit(latency_ms=retry_hit.lookup_latency_ms)
-                if request.stream:
-                    return StreamingResponse(
-                        StreamingUtils.replay_cached_stream(
-                            cached_response=retry_hit.response_data,
-                            model=request.model,
-                        ),
-                        media_type="text/event-stream",
-                        headers={
-                            "X-Cache-Lookup": "HIT",
-                            "X-Cache-Similarity": f"{retry_hit.similarity_score:.4f}",
-                            "X-Lookup-Latency-ms": f"{retry_hit.lookup_latency_ms:.2f}",
-                            "X-RateLimit-Limit": str(rate_limiter.default_limit),
-                            "X-RateLimit-Remaining": str(remaining),
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                        },
-                    )
-
                 response.headers["X-Cache-Lookup"] = "HIT"
+                response.headers["X-Cache-Tier"] = "L2-SEMANTIC"
                 response.headers["X-Cache-Similarity"] = f"{retry_hit.similarity_score:.4f}"
                 response.headers["X-Lookup-Latency-ms"] = f"{retry_hit.lookup_latency_ms:.2f}"
                 return retry_hit.response_data
@@ -165,23 +209,27 @@ async def chat_completions(
                         assembled_data = full_payload
 
                 if assembled_data:
-                    ttl = NegativeCachePolicy.get_adaptive_ttl(assembled_data, 86400)
-                    cache.store(
-                        prompt=user_prompt,
-                        vector=vector,
-                        response_data=assembled_data,
-                        model=request.model,
-                        system_prompt_hash=sys_hash,
-                        params_hash=p_hash,
-                        context_hash=c_hash,
-                        ttl_seconds=ttl,
-                    )
+                    safe, _ = CacheSecurityGuardrail.is_cacheable(user_prompt, assembled_data)
+                    if safe:
+                        ttl = NegativeCachePolicy.get_adaptive_ttl(assembled_data, 86400)
+                        cache.store(
+                            prompt=user_prompt,
+                            vector=vector,
+                            response_data=assembled_data,
+                            model=request.model,
+                            system_prompt_hash=sys_hash,
+                            params_hash=p_hash,
+                            context_hash=c_hash,
+                            ttl_seconds=ttl,
+                        )
+                        exact_cache.store(exact_key, assembled_data, ttl_seconds=ttl)
 
             return StreamingResponse(
                 stream_and_cache_generator(),
                 media_type="text/event-stream",
                 headers={
                     "X-Cache-Lookup": "MISS",
+                    "X-Cache-Tier": "NONE",
                     "X-Cache-Similarity": "0.0",
                     "X-Lookup-Latency-ms": f"{cache_result.lookup_latency_ms:.2f}",
                     "X-RateLimit-Limit": str(rate_limiter.default_limit),
@@ -197,19 +245,23 @@ async def chat_completions(
 
         telemetry.record_miss(latency_ms=llm_latency_ms)
 
-        ttl = NegativeCachePolicy.get_adaptive_ttl(raw_response, 86400)
-        cache.store(
-            prompt=user_prompt,
-            vector=vector,
-            response_data=raw_response,
-            model=request.model,
-            system_prompt_hash=sys_hash,
-            params_hash=p_hash,
-            context_hash=c_hash,
-            ttl_seconds=ttl,
-        )
+        safe, _ = CacheSecurityGuardrail.is_cacheable(user_prompt, raw_response)
+        if safe:
+            ttl = NegativeCachePolicy.get_adaptive_ttl(raw_response, 86400)
+            cache.store(
+                prompt=user_prompt,
+                vector=vector,
+                response_data=raw_response,
+                model=request.model,
+                system_prompt_hash=sys_hash,
+                params_hash=p_hash,
+                context_hash=c_hash,
+                ttl_seconds=ttl,
+            )
+            exact_cache.store(exact_key, raw_response, ttl_seconds=ttl)
 
         response.headers["X-Cache-Lookup"] = "MISS"
+        response.headers["X-Cache-Tier"] = "NONE"
         response.headers["X-Cache-Similarity"] = "0.0"
         response.headers["X-Lookup-Latency-ms"] = f"{cache_result.lookup_latency_ms:.2f}"
         return raw_response
