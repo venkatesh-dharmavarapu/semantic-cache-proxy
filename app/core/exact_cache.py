@@ -11,7 +11,7 @@ class ExactMatchCache:
     PREFIX = "cache:exact:"
 
     def __init__(self, vector_store: VectorStoreManager):
-        self.store = vector_store
+        self.vector_store = vector_store
 
     @classmethod
     def generate_exact_key(
@@ -29,13 +29,12 @@ class ExactMatchCache:
 
     def lookup(self, exact_key: str) -> Optional[Dict[str, Any]]:
         """O(1) exact match lookup bypassing vectorization entirely."""
-        client = self.store.client
+        client = self.vector_store.client
         if not client:
             return None
         try:
             raw = client.get(exact_key)
             if raw:
-                # Update TTL window on L1 hit
                 client.expire(exact_key, 86400)
                 return json.loads(raw)
             return None
@@ -43,12 +42,17 @@ class ExactMatchCache:
             logger.warning("L1 exact cache lookup error: %s", e)
             return None
 
-    def store(self, exact_key: str, response_data: Dict[str, Any], ttl_seconds: int = 86400):
-        """Stores exact match payload in Redis."""
-        client = self.store.client
+    def store_exact(
+        self, exact_key: str, response_data: Dict[str, Any], ttl_seconds: int = 86400
+    ):
+        """Stores exact match payload in Redis without name collision with store attribute."""
+        client = self.vector_store.client
         if not client:
             return
         try:
             client.set(exact_key, json.dumps(response_data), ex=ttl_seconds)
         except Exception as e:
             logger.warning("L1 exact cache store error: %s", e)
+
+    # Alias for compatibility
+    store = store_exact
