@@ -138,6 +138,10 @@ async def chat_completions(
 
     if cache_result.is_hit and cache_result.response_data:
         telemetry.record_hit(latency_ms=cache_result.lookup_latency_ms)
+        # Track similarity score for drift metrics
+        from app.api.admin import drift_tracker
+        drift_tracker.record_hit_similarity(cache_result.similarity_score)
+
         # Hydrate L1 exact cache for subsequent identical requests
         exact_cache.store(exact_key, cache_result.response_data)
 
