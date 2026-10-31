@@ -1,11 +1,15 @@
 from typing import Optional
-from fastapi import APIRouter, Query, Response, status
+from fastapi import APIRouter, Body, Query, Response, status
 from app.api.proxy import cache
+from app.core.drift_detector import SemanticDriftTracker
 from app.schemas.warming_models import CacheWarmRequest, CacheWarmResponse
+from app.services.topology import ClusterTopologyInspector
 from app.services.warmer import CacheWarmer
 
 router = APIRouter(prefix="/v1/cache", tags=["Cache Administration"])
 warmer = CacheWarmer(cache)
+topology_inspector = ClusterTopologyInspector(cache.vector_store)
+drift_tracker = SemanticDriftTracker(cache.vector_store)
 
 
 @router.post("/warm", response_model=CacheWarmResponse, status_code=status.HTTP_200_OK)
@@ -48,6 +52,44 @@ def get_cluster_stats():
     }
 
 
+@router.get("/drift", status_code=status.HTTP_200_OK)
+def get_semantic_drift():
+    """Retrieves rolling similarity metrics, standard deviation, and drift alert status."""
+    return drift_tracker.get_distribution_stats()
+
+
+@router.get("/topology", status_code=status.HTTP_200_OK)
+def get_topology(max_clusters: int = Query(default=30, ge=1, le=100)):
+    """Retrieves cluster centroid hierarchy, alias density, and dispersion distribution."""
+    return topology_inspector.get_topology_map(max_clusters=max_clusters)
+
+
+@router.post("/threshold/tune", status_code=status.HTTP_200_OK)
+def tune_dynamic_threshold(target_confidence: float = Body(default=0.88, embed=True)):
+    """Dynamically recalculates runtime similarity threshold based on rolling drift."""
+    stats = drift_tracker.get_distribution_stats()
+    if stats["sample_count"] < 5:
+        return {
+            "status": "insufficient_data",
+            "current_threshold": cache.similarity_threshold,
+            "recommended_threshold": cache.similarity_threshold,
+        }
+
+    # If mean similarity is tightly clustered with low variance, safely lower threshold to capture more hits
+    mean_val = stats["mean"]
+    std_dev = stats["std_dev"]
+
+    recommended = round(max(0.78, min(0.95, mean_val - (std_dev * 1.5))), 4)
+    cache.similarity_threshold = recommended
+
+    return {
+        "status": "updated",
+        "sample_count": stats["sample_count"],
+        "mean_similarity": mean_val,
+        "new_threshold": recommended,
+    }
+
+
 @router.delete("/purge", status_code=status.HTTP_200_OK)
 def purge_cache(
     model: Optional[str] = Query(default=None, description="Purge entries strictly for a model tag"),
@@ -61,7 +103,7 @@ def purge_cache(
     purged_count = 0
 
     if flush_all:
-        for key in client.scan_iter("cache:llm:*"):
+        for key in client.scan_iter("cache:*"):
             client.delete(key)
             purged_count += 1
         return {
