@@ -2,6 +2,8 @@ from typing import Optional
 from fastapi import APIRouter, Body, Query, Response, status
 from app.api.proxy import cache
 from app.core.drift_detector import SemanticDriftTracker
+from app.core.feedback_manager import CacheFeedbackManager
+from app.schemas.feedback_models import CacheFeedbackRequest, CacheFeedbackResponse
 from app.schemas.warming_models import CacheWarmRequest, CacheWarmResponse
 from app.services.topology import ClusterTopologyInspector
 from app.services.warmer import CacheWarmer
@@ -10,6 +12,27 @@ router = APIRouter(prefix="/v1/cache", tags=["Cache Administration"])
 warmer = CacheWarmer(cache)
 topology_inspector = ClusterTopologyInspector(cache.vector_store)
 drift_tracker = SemanticDriftTracker(cache.vector_store)
+feedback_manager = CacheFeedbackManager(cache.vector_store)
+
+
+@router.post("/feedback", response_model=CacheFeedbackResponse, status_code=status.HTTP_200_OK)
+def submit_cache_feedback(payload: CacheFeedbackRequest):
+    """Submits positive, negative, or flag feedback against a cached completion entry."""
+    result = feedback_manager.record_feedback(
+        cache_key=payload.cache_key,
+        feedback_type=payload.rating,
+        reason=payload.reason,
+        negative_eviction_threshold=payload.threshold or 2,
+    )
+    if result["status"] == "not_found":
+        return Response(status_code=status.HTTP_404_NOT_FOUND, content=result["message"])
+    return result
+
+
+@router.get("/feedback/metrics", status_code=status.HTTP_200_OK)
+def get_feedback_summary():
+    """Returns aggregate positive and negative user satisfaction counts."""
+    return feedback_manager.get_feedback_metrics()
 
 
 @router.post("/warm", response_model=CacheWarmResponse, status_code=status.HTTP_200_OK)
@@ -75,10 +98,8 @@ def tune_dynamic_threshold(target_confidence: float = Body(default=0.88, embed=T
             "recommended_threshold": cache.similarity_threshold,
         }
 
-    # If mean similarity is tightly clustered with low variance, safely lower threshold to capture more hits
     mean_val = stats["mean"]
     std_dev = stats["std_dev"]
-
     recommended = round(max(0.78, min(0.95, mean_val - (std_dev * 1.5))), 4)
     cache.similarity_threshold = recommended
 
