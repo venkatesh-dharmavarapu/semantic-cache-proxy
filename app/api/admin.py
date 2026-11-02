@@ -2,40 +2,70 @@ from typing import Optional
 from fastapi import APIRouter, Body, Query, Response, status
 from app.api.proxy import cache
 from app.core.drift_detector import SemanticDriftTracker
-from app.core.feedback_manager import CacheFeedbackManager
-from app.schemas.feedback_models import CacheFeedbackRequest, CacheFeedbackResponse
+from app.core.feedback_manager import FeedbackManager
+from app.schemas.feedback_models import (
+    FeedbackStatsResponse,
+    FeedbackSubmitRequest,
+    FeedbackSubmitResponse,
+)
 from app.schemas.warming_models import CacheWarmRequest, CacheWarmResponse
 from app.services.topology import ClusterTopologyInspector
 from app.services.warmer import CacheWarmer
 
-router = APIRouter(prefix="/v1/cache", tags=["Cache Administration"])
+router = APIRouter(prefix="/v1", tags=["Administration & Governance"])
 warmer = CacheWarmer(cache)
 topology_inspector = ClusterTopologyInspector(cache.vector_store)
 drift_tracker = SemanticDriftTracker(cache.vector_store)
-feedback_manager = CacheFeedbackManager(cache.vector_store)
+feedback_manager = FeedbackManager(cache.vector_store)
 
 
-@router.post("/feedback", response_model=CacheFeedbackResponse, status_code=status.HTTP_200_OK)
-def submit_cache_feedback(payload: CacheFeedbackRequest):
-    """Submits positive, negative, or flag feedback against a cached completion entry."""
-    result = feedback_manager.record_feedback(
-        cache_key=payload.cache_key,
-        feedback_type=payload.rating,
-        reason=payload.reason,
-        negative_eviction_threshold=payload.threshold or 2,
+# ---------------------------
+# Feedback & Quality Endpoints
+# ---------------------------
+
+@router.post("/feedback", response_model=FeedbackSubmitResponse, status_code=status.HTTP_200_OK)
+def submit_feedback(request: FeedbackSubmitRequest):
+    """Submits user feedback (thumbs up / thumbs down) for a cached completion."""
+    success, score, evicted = feedback_manager.record_feedback(
+        cache_key=request.cache_key,
+        completion_id=request.completion_id,
+        rating=request.rating,
+        reason=request.feedback_reason,
+        user_comment=request.user_comment,
     )
-    if result["status"] == "not_found":
-        return Response(status_code=status.HTTP_404_NOT_FOUND, content=result["message"])
-    return result
+    if not success:
+        return FeedbackSubmitResponse(
+            status="ignored",
+            message="Unable to record feedback. Provide a valid cache_key or completion_id.",
+            target_key=request.cache_key or request.completion_id,
+            current_net_score=score,
+            evicted=False,
+        )
+
+    msg = "Feedback registered successfully."
+    if evicted:
+        msg = "Feedback registered. Entry breached negative threshold and was evicted."
+
+    return FeedbackSubmitResponse(
+        status="success",
+        message=msg,
+        target_key=request.cache_key or request.completion_id,
+        current_net_score=score,
+        evicted=evicted,
+    )
 
 
-@router.get("/feedback/metrics", status_code=status.HTTP_200_OK)
-def get_feedback_summary():
-    """Returns aggregate positive and negative user satisfaction counts."""
-    return feedback_manager.get_feedback_metrics()
+@router.get("/cache/feedback/stats", response_model=FeedbackStatsResponse, status_code=status.HTTP_200_OK)
+def get_feedback_statistics():
+    """Retrieves overall user satisfaction rates, ratings volume, and eviction tallies."""
+    return feedback_manager.get_feedback_stats()
 
 
-@router.post("/warm", response_model=CacheWarmResponse, status_code=status.HTTP_200_OK)
+# ---------------------------
+# Cache Management & Warmer
+# ---------------------------
+
+@router.post("/cache/warm", response_model=CacheWarmResponse, status_code=status.HTTP_200_OK)
 async def warm_cache(request: CacheWarmRequest):
     """Pre-seeds the Redis semantic cache with batches of high-frequency prompts."""
     successes, failures = await warmer.warm_batch(request)
@@ -46,7 +76,7 @@ async def warm_cache(request: CacheWarmRequest):
     )
 
 
-@router.get("/clusters", status_code=status.HTTP_200_OK)
+@router.get("/cache/clusters", status_code=status.HTTP_200_OK)
 def get_cluster_stats():
     """Inspects cluster density, aliased prompts, and vector index memory distribution."""
     client = cache.vector_store.client
@@ -75,19 +105,19 @@ def get_cluster_stats():
     }
 
 
-@router.get("/drift", status_code=status.HTTP_200_OK)
+@router.get("/cache/drift", status_code=status.HTTP_200_OK)
 def get_semantic_drift():
     """Retrieves rolling similarity metrics, standard deviation, and drift alert status."""
     return drift_tracker.get_distribution_stats()
 
 
-@router.get("/topology", status_code=status.HTTP_200_OK)
+@router.get("/cache/topology", status_code=status.HTTP_200_OK)
 def get_topology(max_clusters: int = Query(default=30, ge=1, le=100)):
     """Retrieves cluster centroid hierarchy, alias density, and dispersion distribution."""
     return topology_inspector.get_topology_map(max_clusters=max_clusters)
 
 
-@router.post("/threshold/tune", status_code=status.HTTP_200_OK)
+@router.post("/cache/threshold/tune", status_code=status.HTTP_200_OK)
 def tune_dynamic_threshold(target_confidence: float = Body(default=0.88, embed=True)):
     """Dynamically recalculates runtime similarity threshold based on rolling drift."""
     stats = drift_tracker.get_distribution_stats()
@@ -100,6 +130,7 @@ def tune_dynamic_threshold(target_confidence: float = Body(default=0.88, embed=T
 
     mean_val = stats["mean"]
     std_dev = stats["std_dev"]
+
     recommended = round(max(0.78, min(0.95, mean_val - (std_dev * 1.5))), 4)
     cache.similarity_threshold = recommended
 
@@ -111,7 +142,7 @@ def tune_dynamic_threshold(target_confidence: float = Body(default=0.88, embed=T
     }
 
 
-@router.delete("/purge", status_code=status.HTTP_200_OK)
+@router.delete("/cache/purge", status_code=status.HTTP_200_OK)
 def purge_cache(
     model: Optional[str] = Query(default=None, description="Purge entries strictly for a model tag"),
     flush_all: bool = Query(default=False, description="Purge all entries in the cache index"),
