@@ -124,6 +124,7 @@ async def chat_completions(
         response.headers["X-Cache-Lookup"] = "HIT"
         response.headers["X-Cache-Tier"] = "L1-EXACT"
         response.headers["X-Cache-Similarity"] = "1.0000"
+        response.headers["X-Cache-Key"] = exact_key
         response.headers["X-Lookup-Latency-ms"] = f"{l1_latency:.2f}"
         return l1_cached
 
@@ -167,6 +168,7 @@ async def chat_completions(
         response.headers["X-Cache-Lookup"] = "HIT"
         response.headers["X-Cache-Tier"] = "L2-SEMANTIC"
         response.headers["X-Cache-Similarity"] = f"{cache_result.similarity_score:.4f}"
+        response.headers["X-Cache-Key"] = cache_result.cache_key or exact_key
         response.headers["X-Lookup-Latency-ms"] = f"{cache_result.lookup_latency_ms:.2f}"
         return cache_result.response_data
 
@@ -267,6 +269,7 @@ async def chat_completions(
         response.headers["X-Cache-Lookup"] = "MISS"
         response.headers["X-Cache-Tier"] = "NONE"
         response.headers["X-Cache-Similarity"] = "0.0"
+        response.headers["X-Cache-Key"] = exact_key
         response.headers["X-Lookup-Latency-ms"] = f"{cache_result.lookup_latency_ms:.2f}"
         return raw_response
     finally:
