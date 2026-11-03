@@ -8,7 +8,14 @@ from app.schemas.feedback_models import (
     FeedbackSubmitRequest,
     FeedbackSubmitResponse,
 )
+from app.schemas.migration_models import (
+    BatchIngestionRequest,
+    BatchIngestionResponse,
+    SchemaMigrationRequest,
+    SchemaMigrationResponse,
+)
 from app.schemas.warming_models import CacheWarmRequest, CacheWarmResponse
+from app.services.migration_engine import CacheMigrationEngine
 from app.services.topology import ClusterTopologyInspector
 from app.services.warmer import CacheWarmer
 
@@ -17,6 +24,38 @@ warmer = CacheWarmer(cache)
 topology_inspector = ClusterTopologyInspector(cache.vector_store)
 drift_tracker = SemanticDriftTracker(cache.vector_store)
 feedback_manager = FeedbackManager(cache.vector_store)
+migration_engine = CacheMigrationEngine(cache)
+
+
+# ---------------------------
+# Bulk Ingestion & Migration
+# ---------------------------
+
+@router.post("/cache/ingest/batch", response_model=BatchIngestionResponse, status_code=status.HTTP_200_OK)
+async def ingest_batch_logs(request: BatchIngestionRequest):
+    """Bulk-loads historical query logs or synthetic benchmarks directly into the vector index."""
+    raw_dicts = [rec.model_dump() for rec in request.records]
+    successes, failures = await migration_engine.ingest_batch_records(
+        records=raw_dicts, chunk_size=request.chunk_size
+    )
+    return BatchIngestionResponse(
+        status="completed",
+        total_received=len(request.records),
+        successfully_indexed=successes,
+        failures=failures,
+    )
+
+
+@router.post("/cache/migrate", response_model=SchemaMigrationResponse, status_code=status.HTTP_200_OK)
+def trigger_schema_migration(request: SchemaMigrationRequest):
+    """Prepares schema migration and inspects cutover targets across versioned vector indices."""
+    res = migration_engine.migrate_index_schema(new_index_name=request.target_index_name)
+    return SchemaMigrationResponse(
+        status=res.get("status", "error"),
+        current_index=res.get("current_index", ""),
+        target_index=res.get("target_index", ""),
+        total_keys_ready_for_cutover=res.get("total_keys_ready_for_cutover", 0),
+    )
 
 
 # ---------------------------
