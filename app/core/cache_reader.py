@@ -47,6 +47,7 @@ class CacheReader:
         )
 
         dense_results: List[Dict[str, Any]] = []
+        dense_distance_map: Dict[str, float] = {}
 
         # 1. Query Dense Vector Index (HNSW)
         query = VectorQuery(
@@ -59,6 +60,10 @@ class CacheReader:
 
         try:
             dense_results = self.store.index.query(query)
+            for d in dense_results:
+                dense_id = d.get("id") or d.get("key")
+                if dense_id and "vector_distance" in d:
+                    dense_distance_map[dense_id] = float(d["vector_distance"])
         except Exception as e:
             logger.warning("Error querying vector index: %s", e)
 
@@ -86,21 +91,28 @@ class CacheReader:
             fused = HybridSearchFusion.compute_rrf_scores(dense_results, sparse_results)
             if fused:
                 top_record, _ = fused[0]
-                vector_dist = float(top_record.get("vector_distance", 0.05))
-                similarity_score = 1.0 - vector_dist
+                top_id = top_record.get("id") or top_record.get("key")
+
+                # Retrieve true vector distance from dense query if available
+                if top_id in dense_distance_map:
+                    vector_dist = dense_distance_map[top_id]
+                else:
+                    vector_dist = float(top_record.get("vector_distance", 0.0))
+
+                similarity_score = max(0.0, 1.0 - vector_dist)
                 if similarity_score >= (threshold - 0.03):
                     response_json = json.loads(top_record["response_json"])
-                    return response_json, similarity_score, top_record["id"]
+                    return response_json, similarity_score, top_id
 
-        # Default fallback to top dense match
+        # Fallback to top dense match
         if dense_results:
             top_result = dense_results[0]
             vector_distance = float(top_result.get("vector_distance", 1.0))
-            similarity_score = 1.0 - vector_distance
+            similarity_score = max(0.0, 1.0 - vector_distance)
 
             if similarity_score >= threshold:
                 response_json = json.loads(top_result["response_json"])
-                entry_key = top_result["id"]
+                entry_key = top_result.get("id") or top_result.get("key")
                 return response_json, similarity_score, entry_key
 
         return None
