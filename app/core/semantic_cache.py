@@ -86,6 +86,7 @@ class SemanticCache:
             params_hash=p_hash,
             context_hash=c_hash,
             similarity_threshold=threshold,
+            raw_prompt=user_prompt,
         )
 
         lookup_time = (time.perf_counter() - start_time) * 1000.0
