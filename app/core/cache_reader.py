@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from redisvl.query import FilterQuery, VectorQuery
 from app.config import settings
+from app.core.cross_encoder import CrossEncoderVerifier
 from app.core.hybrid_search import HybridSearchFusion
 from app.core.vector_store import VectorStoreManager
 
@@ -55,7 +56,7 @@ class CacheReader:
             vector_field_name="prompt_vector",
             return_fields=["prompt", "response_json", "vector_distance", "hit_count"],
             filter_expression=filter_expression,
-            num_results=max(top_k, 3),
+            num_results=max(top_k, 5),
         )
 
         try:
@@ -67,7 +68,7 @@ class CacheReader:
         except Exception as e:
             logger.warning("Error querying vector index: %s", e)
 
-        # 2. Query Sparse Text Index (BM25) if raw prompt provided
+        # 2. Query Sparse Text Index (BM25)
         sparse_results: List[Dict[str, Any]] = []
         if raw_prompt and self.store.index:
             try:
@@ -76,46 +77,58 @@ class CacheReader:
                 sparse_query = FilterQuery(
                     return_fields=["prompt", "response_json", "hit_count"],
                     filter_expression=sparse_filter,
-                    num_results=max(top_k, 3),
+                    num_results=max(top_k, 5),
                 )
                 sparse_results = self.store.index.query(sparse_query)
             except Exception as e:
                 logger.debug("Sparse query skipped or empty: %s", e)
 
-        # 3. Fuse via RRF if candidates present
         if not dense_results and not sparse_results:
             return None
 
-        # If both dense and sparse returned results, fuse them
+        # Candidate selection with RRF
+        candidate_record = None
+        similarity_score = 0.0
+
         if dense_results and sparse_results:
             fused = HybridSearchFusion.compute_rrf_scores(dense_results, sparse_results)
             if fused:
                 top_record, _ = fused[0]
                 top_id = top_record.get("id") or top_record.get("key")
-
-                # Retrieve true vector distance from dense query if available
-                if top_id in dense_distance_map:
-                    vector_dist = dense_distance_map[top_id]
-                else:
-                    vector_dist = float(top_record.get("vector_distance", 0.0))
-
+                vector_dist = dense_distance_map.get(
+                    top_id, float(top_record.get("vector_distance", 0.0))
+                )
                 similarity_score = max(0.0, 1.0 - vector_dist)
                 if similarity_score >= (threshold - 0.03):
-                    response_json = json.loads(top_record["response_json"])
-                    return response_json, similarity_score, top_id
-
-        # Fallback to top dense match
-        if dense_results:
+                    candidate_record = top_record
+        elif dense_results:
             top_result = dense_results[0]
             vector_distance = float(top_result.get("vector_distance", 1.0))
             similarity_score = max(0.0, 1.0 - vector_distance)
-
             if similarity_score >= threshold:
-                response_json = json.loads(top_result["response_json"])
-                entry_key = top_result.get("id") or top_result.get("key")
-                return response_json, similarity_score, entry_key
+                candidate_record = top_result
 
-        return None
+        if not candidate_record:
+            return None
+
+        # 3. Stage 2 Cross-Encoder Intent Verification
+        if raw_prompt:
+            cached_prompt = candidate_record.get("prompt", "")
+            is_valid, _ = CrossEncoderVerifier.verify_intent_consistency(
+                query=raw_prompt,
+                candidate_prompt=cached_prompt,
+            )
+            if not is_valid:
+                logger.info(
+                    "Cross-encoder rejected candidate '%s' for incoming query '%s'",
+                    cached_prompt,
+                    raw_prompt,
+                )
+                return None
+
+        response_json = json.loads(candidate_record["response_json"])
+        entry_key = candidate_record.get("id") or candidate_record.get("key")
+        return response_json, similarity_score, entry_key
 
     def extend_key_ttl(self, entry_key: str, extension_seconds: int = 86400):
         try:
