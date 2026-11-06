@@ -1,6 +1,7 @@
 from typing import Optional
 from fastapi import APIRouter, Body, Query, Response, status
 from app.api.proxy import cache
+from app.api.proxy import session_manager
 from app.core.drift_detector import SemanticDriftTracker
 from app.core.feedback_manager import FeedbackManager
 from app.schemas.feedback_models import (
@@ -219,4 +220,20 @@ def purge_cache(
         "status": "ignored",
         "message": "Specify either 'model' or 'flush_all=true' to execute purge",
         "purged_count": 0,
+    }
+
+@router.post("/chat/sessions/prune", status_code=status.HTTP_200_OK)
+def prune_session_tree(
+    session_id: str = Body(..., embed=True),
+    after_turn: int = Body(..., embed=True),
+):
+    """Prunes and invalidates conversational cache turns that occurred after an edited turn index."""
+    invalidated_count = session_manager.prune_branches_after_turn(
+        session_id=session_id, turn_index=after_turn
+    )
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "pruned_after_turn": after_turn,
+        "invalidated_turns_count": invalidated_count,
     }
