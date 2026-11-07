@@ -14,18 +14,16 @@ class ContextNormalizer:
     ) -> Tuple[List[Dict[str, Any]], str, str]:
         """
         Partitions message history into:
-        1. active_turn: The final user message.
-        2. local_window: The last N prior messages.
-        3. history_digest: SHA-256 digest of messages preceding the local window.
-        Returns: (local_window, history_digest, current_prompt)
+        1. local_window: The last N prior messages.
+        2. history_digest: SHA-256 digest of messages preceding the local window, or 'stateless'/'root'.
+        3. current_prompt: The final user message content.
         """
         if not messages:
-            return [], "empty", ""
+            return [], "stateless", ""
 
-        # Filter out system messages from history chaining (system prompt is hashed separately)
         chat_turns = [m for m in messages if m.get("role") != "system"]
         if not chat_turns:
-            return [], "empty", ""
+            return [], "stateless", ""
 
         current_prompt = chat_turns[-1].get("content", "").strip()
         prior_turns = chat_turns[:-1]
@@ -40,7 +38,6 @@ class ContextNormalizer:
             split_idx = len(prior_turns) - window_size
             older_history = prior_turns[:split_idx]
             local_window = prior_turns[split_idx:]
-            
             raw_history_str = json.dumps(older_history, sort_keys=True)
             history_digest = hashlib.sha256(raw_history_str.encode("utf-8")).hexdigest()[:16]
 
@@ -52,7 +49,14 @@ class ContextNormalizer:
         local_window: List[Dict[str, Any]],
         history_digest: str,
     ) -> str:
-        """Computes a deterministic hash for multi-turn local dialogue state."""
+        """
+        Computes a deterministic hash for multi-turn local dialogue state.
+        For standalone single-turn messages (empty window and stateless history),
+        it returns 'stateless' to remain compatible with pre-warmed & migrated entries.
+        """
+        if not local_window and history_digest in ("stateless", "empty"):
+            return "stateless"
+
         normalized_window = [
             {"role": m.get("role"), "content": m.get("content", "").strip()}
             for m in local_window
