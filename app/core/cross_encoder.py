@@ -19,15 +19,25 @@ class CrossEncoderVerifier:
     STOPWORDS = {
         "a", "an", "the", "in", "on", "at", "to", "for", "of", "with",
         "by", "is", "are", "was", "were", "be", "been", "how", "what",
-        "why", "can", "could", "do", "does", "did", "i", "you", "it"
+        "why", "can", "could", "do", "does", "did", "i", "you", "it",
+        "me", "my", "please"
     }
+
+    @classmethod
+    def _stem(cls, word: str) -> str:
+        """Lightweight heuristic stemmer for plurals and common suffixes."""
+        w = word.lower()
+        for suffix in ("ation", "tions", "tion", "ing", "ies", "es", "ed", "s"):
+            if len(w) > len(suffix) + 3 and w.endswith(suffix):
+                return w[:-len(suffix)]
+        return w
 
     @classmethod
     def verify_intent_consistency(
         cls,
         query: str,
         candidate_prompt: str,
-        threshold: float = 0.65,
+        threshold: float = 0.50,
     ) -> tuple[bool, float]:
         """
         Calculates cross-attention/lexical alignment score on content terms.
@@ -51,19 +61,23 @@ class CrossEncoderVerifier:
             )
             return False, 0.20
 
-        # Filter stopwords to compute content alignment
-        q_content = raw_q - cls.STOPWORDS or raw_q
-        c_content = raw_c - cls.STOPWORDS or raw_c
+        # Filter stopwords
+        q_content = {w for w in raw_q if w not in cls.STOPWORDS} or raw_q
+        c_content = {w for w in raw_c if w not in cls.STOPWORDS} or raw_c
 
-        intersection = q_content.intersection(c_content)
-        union = q_content.union(c_content)
+        # Stemmed content sets for inflection resilience
+        q_stemmed = {cls._stem(w) for w in q_content}
+        c_stemmed = {cls._stem(w) for w in c_content}
+
+        intersection = q_stemmed.intersection(c_stemmed)
+        union = q_stemmed.union(c_stemmed)
         jaccard = len(intersection) / len(union) if union else 0.0
 
-        overlap_q = len(intersection) / len(q_content) if q_content else 0.0
-        overlap_c = len(intersection) / len(c_content) if c_content else 0.0
+        overlap_q = len(intersection) / len(q_stemmed) if q_stemmed else 0.0
+        overlap_c = len(intersection) / len(c_stemmed) if c_stemmed else 0.0
         max_overlap = max(overlap_q, overlap_c)
 
         score = (jaccard * 0.4) + (max_overlap * 0.6)
 
-        is_valid = score >= threshold or max_overlap >= 0.75
+        is_valid = score >= threshold or max_overlap >= 0.60
         return is_valid, round(score, 4)
