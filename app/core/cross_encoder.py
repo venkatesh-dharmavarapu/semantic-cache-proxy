@@ -16,28 +16,33 @@ class CrossEncoderVerifier:
         "create", "add", "insert", "update", "rename", "list", "show"
     }
 
+    STOPWORDS = {
+        "a", "an", "the", "in", "on", "at", "to", "for", "of", "with",
+        "by", "is", "are", "was", "were", "be", "been", "how", "what",
+        "why", "can", "could", "do", "does", "did", "i", "you", "it"
+    }
+
     @classmethod
     def verify_intent_consistency(
         cls,
         query: str,
         candidate_prompt: str,
-        threshold: float = 0.75,
+        threshold: float = 0.65,
     ) -> tuple[bool, float]:
         """
-        Calculates cross-attention/lexical alignment score.
+        Calculates cross-attention/lexical alignment score on content terms.
         Returns: (is_valid: bool, confidence_score: float)
         """
-        q_tokens = set(re.findall(r"\w+", query.lower()))
-        c_tokens = set(re.findall(r"\w+", candidate_prompt.lower()))
+        raw_q = set(re.findall(r"\w+", query.lower()))
+        raw_c = set(re.findall(r"\w+", candidate_prompt.lower()))
 
-        if not q_tokens or not c_tokens:
+        if not raw_q or not raw_c:
             return False, 0.0
 
         # Check for conflicting action verbs or polar operators
-        q_actions = q_tokens.intersection(cls.KEYWORD_NEGATIONS)
-        c_actions = c_tokens.intersection(cls.KEYWORD_NEGATIONS)
+        q_actions = raw_q.intersection(cls.KEYWORD_NEGATIONS)
+        c_actions = raw_c.intersection(cls.KEYWORD_NEGATIONS)
 
-        # Contradictory action intent detected (e.g. 'delete' vs 'rename')
         if q_actions and c_actions and q_actions != c_actions:
             logger.debug(
                 "Cross-encoder rejected candidate due to action contradiction: %s vs %s",
@@ -46,13 +51,19 @@ class CrossEncoderVerifier:
             )
             return False, 0.20
 
-        # Jaccard + Overlap alignment score
-        intersection = q_tokens.intersection(c_tokens)
-        union = q_tokens.union(c_tokens)
+        # Filter stopwords to compute content alignment
+        q_content = raw_q - cls.STOPWORDS or raw_q
+        c_content = raw_c - cls.STOPWORDS or raw_c
+
+        intersection = q_content.intersection(c_content)
+        union = q_content.union(c_content)
         jaccard = len(intersection) / len(union) if union else 0.0
 
-        overlap_ratio = len(intersection) / len(q_tokens) if q_tokens else 0.0
-        score = (jaccard * 0.4) + (overlap_ratio * 0.6)
+        overlap_q = len(intersection) / len(q_content) if q_content else 0.0
+        overlap_c = len(intersection) / len(c_content) if c_content else 0.0
+        max_overlap = max(overlap_q, overlap_c)
 
-        is_valid = score >= threshold or overlap_ratio >= 0.80
+        score = (jaccard * 0.4) + (max_overlap * 0.6)
+
+        is_valid = score >= threshold or max_overlap >= 0.75
         return is_valid, round(score, 4)
