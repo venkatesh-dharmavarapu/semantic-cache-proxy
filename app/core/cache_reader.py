@@ -137,3 +137,33 @@ class CacheReader:
                 self.store.client.expire(entry_key, extension_seconds)
         except Exception as e:
             logger.warning("Failed to extend TTL for %s: %s", entry_key, e)
+
+    def query_similarity(
+        self,
+        vector: List[float],
+        model: str,
+        system_prompt_hash: str,
+        params_hash: str,
+        context_hash: str = "stateless",
+        tenant_id: str = "default",
+        similarity_threshold: Optional[float] = None,
+        top_k: int = 1,
+        raw_prompt: Optional[str] = None,
+    ) -> Optional[Tuple[Dict[str, Any], float, str]]:
+        threshold = similarity_threshold or settings.DEFAULT_SIMILARITY_THRESHOLD
+        vector_bytes = np.array(vector, dtype=np.float32).tobytes()
+
+        clean_model = escape_redis_tag(model)
+        clean_sys = escape_redis_tag(system_prompt_hash)
+        clean_params = escape_redis_tag(params_hash)
+        clean_ctx = escape_redis_tag(context_hash)
+        clean_tenant = escape_redis_tag(tenant_id)
+
+        filter_expression = (
+            f"(@model:{{{clean_model}}}) & "
+            f"(@system_prompt_hash:{{{clean_sys}}}) & "
+            f"(@params_hash:{{{clean_params}}}) & "
+            f"(@context_hash:{{{clean_ctx}}}) & "
+            f"(@tenant_id:{{{clean_tenant}}})"
+        )
+        # Remaining logic follows stage 1 search and cross-encoder verification...
