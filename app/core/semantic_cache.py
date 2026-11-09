@@ -66,6 +66,7 @@ class SemanticCache:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         similarity_threshold: Optional[float] = None,
+        tenant_id: str = "default",
     ) -> Tuple[CacheResult, List[float], str, str, str]:
         start_time = time.perf_counter()
         user_prompt, system_prompt = self._extract_prompt_and_system(messages)
@@ -101,6 +102,7 @@ class SemanticCache:
                     similarity_score=similarity,
                     response_data=response_json,
                     cached_prompt=None,
+                    tenant_id=tenant_id,
                     lookup_latency_ms=lookup_time,
                     cache_key=key,
                 ),
@@ -135,6 +137,7 @@ class SemanticCache:
         params_hash: str,
         context_hash: str = "stateless",
         ttl_seconds: Optional[int] = None,
+        tenant_id: str = "default",
     ) -> str:
         return self.writer.store_response(
             prompt=prompt,
@@ -144,5 +147,6 @@ class SemanticCache:
             system_prompt_hash=system_prompt_hash,
             params_hash=params_hash,
             context_hash=context_hash,
+            tenant_id=tenant_id,
             ttl_seconds=ttl_seconds,
         )
