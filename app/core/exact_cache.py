@@ -21,14 +21,14 @@ class ExactMatchCache:
         system_prompt_hash: str,
         params_hash: str,
         context_hash: str = "stateless",
+        tenant_id: str = "default",
     ) -> str:
-        """Computes deterministic SHA-256 key for O(1) exact-match caching."""
-        normalized = f"{model.strip().lower()}::{system_prompt_hash}::{params_hash}::{context_hash}::{prompt.strip()}"
+        """Computes deterministic SHA-256 key namespaced by tenant."""
+        normalized = f"{tenant_id}::{model.strip().lower()}::{system_prompt_hash}::{params_hash}::{context_hash}::{prompt.strip()}"
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        return f"{cls.PREFIX}{digest}"
+        return f"{cls.PREFIX}{tenant_id}:{digest}"
 
     def lookup(self, exact_key: str) -> Optional[Dict[str, Any]]:
-        """O(1) exact match lookup bypassing vectorization entirely."""
         client = self.vector_store.client
         if not client:
             return None
@@ -45,7 +45,6 @@ class ExactMatchCache:
     def store_exact(
         self, exact_key: str, response_data: Dict[str, Any], ttl_seconds: int = 86400
     ):
-        """Stores exact match payload in Redis without name collision with store attribute."""
         client = self.vector_store.client
         if not client:
             return
@@ -54,5 +53,4 @@ class ExactMatchCache:
         except Exception as e:
             logger.warning("L1 exact cache store error: %s", e)
 
-    # Alias for compatibility
     store = store_exact
