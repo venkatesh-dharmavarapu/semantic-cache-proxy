@@ -4,6 +4,7 @@ from app.api.proxy import cache
 from app.api.proxy import session_manager
 from app.core.drift_detector import SemanticDriftTracker
 from app.core.feedback_manager import FeedbackManager
+from app.core.tenant_policy import TenantPurgeService
 from app.schemas.feedback_models import (
     FeedbackStatsResponse,
     FeedbackSubmitRequest,
@@ -236,4 +237,23 @@ def prune_session_tree(
         "session_id": session_id,
         "pruned_after_turn": after_turn,
         "invalidated_turns_count": invalidated_count,
+    }
+
+
+@router.delete("/cache/tenants/{tenant_id}", status_code=status.HTTP_200_OK)
+def purge_tenant_cache(tenant_id: str):
+    """
+    Purges all exact keys, vector entries, budgets, and rate limits
+    belonging exclusively to the designated tenant.
+    """
+    client = cache.vector_store.client
+    if not client:
+        return {"status": "error", "message": "Redis client not connected"}
+
+    purged_count = TenantPurgeService.purge_tenant_namespace(client, tenant_id)
+    return {
+        "status": "success",
+        "tenant_id": tenant_id,
+        "purged_keys_count": purged_count,
+        "message": f"Tenant '{tenant_id}' namespace successfully cleared.",
     }
