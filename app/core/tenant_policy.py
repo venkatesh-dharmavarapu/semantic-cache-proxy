@@ -1,6 +1,10 @@
 from enum import Enum
 from typing import Dict, Optional
 from pydantic import BaseModel, Field
+import logging
+import redis
+
+logger = logging.getLogger(__name__)
 
 
 class TenantTier(str, Enum):
@@ -56,3 +60,44 @@ class TenantPolicyManager:
     def register_tenant(self, tenant_id: str, config: TenantConfig):
         """Registers custom policy settings for a specific tenant ID."""
         self.custom_tenants[tenant_id] = config
+
+
+class TenantPurgeService:
+    @staticmethod
+    def purge_tenant_namespace(client: redis.Redis, tenant_id: str) -> int:
+        """
+        Atomically removes all L1 exact keys, rate limits, token quotas,
+        and L2 semantic vector entries for a specific tenant namespace.
+        """
+        if not client or not tenant_id:
+            return 0
+
+        purged_count = 0
+
+        # 1. Purge L1 Exact Match keys: cache:exact:<tenant_id>:*
+        exact_pattern = f"cache:exact:{tenant_id}:*"
+        for key in client.scan_iter(exact_pattern):
+            client.delete(key)
+            purged_count += 1
+
+        # 2. Purge Rate Limiting keys: ratelimit:<tenant_id>:*
+        ratelimit_pattern = f"ratelimit:{tenant_id}:*"
+        for key in client.scan_iter(ratelimit_pattern):
+            client.delete(key)
+            purged_count += 1
+
+        # 3. Purge Token Budget Quota keys: budget:tenant:<tenant_id>:*
+        budget_pattern = f"budget:tenant:{tenant_id}:*"
+        for key in client.scan_iter(budget_pattern):
+            client.delete(key)
+            purged_count += 1
+
+        # 4. Purge L2 Vector Hash entries tagged with this tenant_id
+        for key in client.scan_iter("cache:llm:*"):
+            stored_tenant = client.hget(key, "tenant_id")
+            if stored_tenant and stored_tenant.decode("utf-8") == tenant_id:
+                client.delete(key)
+                purged_count += 1
+
+        logger.info("Purged %d total keys for tenant '%s'", purged_count, tenant_id)
+        return purged_count
