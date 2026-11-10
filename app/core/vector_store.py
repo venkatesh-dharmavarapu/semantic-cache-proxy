@@ -15,19 +15,26 @@ class VectorStoreManager:
 
     def connect(self):
         if self.client is None:
-            self.client = redis.Redis(
-                host=settings.REDIS_HOST,
-                port=settings.REDIS_PORT,
-                password=settings.REDIS_PASSWORD or None,
+            self.client = redis.Redis.from_url(
+                settings.REDIS_URL,
                 decode_responses=False,
             )
-            self._init_index()
+            self.create_index(overwrite=False)
 
-    def _init_index(self):
+    def create_index(self, overwrite: bool = False):
+        """Initializes or ensures the RediSearch schema index exists."""
+        if self.client is None:
+            self.client = redis.Redis.from_url(
+                settings.REDIS_URL,
+                decode_responses=False,
+            )
+
+        dims = getattr(settings, "EMBEDDING_DIMS", getattr(settings, "EMBEDDING_DIM", 768))
+
         schema_dict = {
             "index": {
                 "name": settings.CACHE_INDEX_NAME,
-                "prefix": settings.CACHE_KEY_PREFIX,
+                "prefix": settings.CACHE_PREFIX,
                 "storage_type": "hash",
             },
             "fields": [
@@ -46,7 +53,7 @@ class VectorStoreManager:
                     "name": "prompt_vector",
                     "type": "vector",
                     "attrs": {
-                        "dims": settings.EMBEDDING_DIMENSION,
+                        "dims": dims,
                         "distance_metric": "cosine",
                         "algorithm": "hnsw",
                         "datatype": "float32",
@@ -57,7 +64,10 @@ class VectorStoreManager:
         schema = IndexSchema.from_dict(schema_dict)
         self.index = SearchIndex(schema=schema, redis_client=self.client)
         try:
-            self.index.create(overwrite=False)
+            self.index.create(overwrite=overwrite)
         except Exception:
             # Index already initialized
             pass
+
+    # Alias for internal backwards compatibility
+    _init_index = create_index
