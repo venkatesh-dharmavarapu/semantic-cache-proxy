@@ -1,10 +1,12 @@
 import time
 from fastapi import APIRouter, Header, Request, Response
 from fastapi.responses import StreamingResponse
+from app.core.budget_guardrail import TenantBudgetGuardrail
 from app.core.context_normalizer import ContextNormalizer
+from app.core.cost_calculator import TokenCostCalculator
 from app.core.distributed_lock import DistributedCacheLock
 from app.core.exact_cache import ExactMatchCache
-from app.core.exceptions import RateLimitExceededError
+from app.core.exceptions import RateLimitExceededError, TenantBudgetExceededError
 from app.core.hasher import CacheKeyHasher
 from app.core.negative_cache import NegativeCachePolicy
 from app.core.profiler import RequestProfiler
@@ -15,6 +17,7 @@ from app.core.session_manager import SessionThreadManager
 from app.core.sla_tracker import SLATracker
 from app.core.streaming import StreamingUtils
 from app.core.telemetry import TelemetryTracker
+from app.core.tenant_policy import TenantPolicyManager
 from app.schemas.chat_models import ChatCompletionRequest
 from app.services.llm_client import LLMClient
 
@@ -28,6 +31,8 @@ sla_tracker = SLATracker(cache.vector_store)
 rate_limiter = SlidingWindowRateLimiter(default_limit=60, window_seconds=60)
 cache_lock = DistributedCacheLock(cache.vector_store)
 session_manager = SessionThreadManager(cache.vector_store)
+budget_guardrail = TenantBudgetGuardrail(cache.vector_store)
+tenant_policy_manager = TenantPolicyManager()
 
 
 @router.post("/chat/completions")
@@ -39,30 +44,44 @@ async def chat_completions(
     x_similarity_threshold: float | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
     x_turn_index: int | None = Header(default=None),
+    x_tenant_id: str = Header(default="default"),
 ):
     profiler = RequestProfiler()
+    tenant_cfg = tenant_policy_manager.get_config(x_tenant_id)
     client_ip = (
         req.headers.get("x-forwarded-for")
         or (req.client.host if req.client else "127.0.0.1")
     )
 
-    # 1. Rate limiter check
-    profiler.start("rate_limit")
-    allowed, remaining, retry_after = rate_limiter.check_rate_limit(client_ip)
-    profiler.stop("rate_limit")
+    # 1. Tenant-scoped rate limiting (keyed by tenant + IP)
+    rate_limit_key = f"{x_tenant_id}:{client_ip}"
+    allowed, remaining, retry_after = rate_limiter.check_rate_limit(
+        rate_limit_key, limit=tenant_cfg.rate_limit_per_minute
+    )
     if not allowed:
         raise RateLimitExceededError(
-            retry_after=retry_after, limit=rate_limiter.default_limit
+            retry_after=retry_after, limit=tenant_cfg.rate_limit_per_minute
         )
 
-    response.headers["X-RateLimit-Limit"] = str(rate_limiter.default_limit)
+    response.headers["X-RateLimit-Limit"] = str(tenant_cfg.rate_limit_per_minute)
     response.headers["X-RateLimit-Remaining"] = str(remaining)
+    response.headers["X-Tenant-ID"] = x_tenant_id
+
+    # 2. Daily token quota verification
+    quota_ok, used_tokens = budget_guardrail.check_quota(
+        x_tenant_id, max_tokens=tenant_cfg.token_quota_daily
+    )
+    if not quota_ok:
+        raise TenantBudgetExceededError(
+            tenant_id=x_tenant_id,
+            current_used=used_tokens,
+            max_tokens=tenant_cfg.token_quota_daily,
+        )
 
     profiler.start("hash")
     serialized_messages = [msg.model_dump() for msg in request.messages]
     user_prompt, system_prompt = cache._extract_prompt_and_system(serialized_messages)
 
-    # Sliding-window multi-turn partition
     local_window, history_digest, _ = ContextNormalizer.partition_context(serialized_messages)
     c_hash = ContextNormalizer.compute_turn_context_hash(local_window, history_digest)
 
@@ -72,7 +91,10 @@ async def chat_completions(
     )
     profiler.stop("hash")
 
-    # 2. Handle Explicit Cache Bypass
+    # Dynamic similarity threshold: explicit header > tenant policy default
+    active_threshold = x_similarity_threshold or tenant_cfg.similarity_threshold
+
+    # 3. Explicit Cache Bypass
     if x_cache_bypass:
         telemetry.record_bypass()
         payload = request.model_dump(exclude_none=True)
@@ -101,6 +123,10 @@ async def chat_completions(
         raw_response = await llm_client.forward_chat_completion(payload)
         profiler.stop("upstream")
 
+        # Track token consumption against budget
+        _, _, total_tokens = TokenCostCalculator.extract_tokens(raw_response)
+        budget_guardrail.record_usage(x_tenant_id, total_tokens)
+
         response.headers["X-Cache-Lookup"] = "BYPASS"
         response.headers["X-Cache-Tier"] = "NONE"
         response.headers["X-Cache-Similarity"] = "0.0"
@@ -108,13 +134,14 @@ async def chat_completions(
         response.headers["Server-Timing"] = profiler.to_server_timing_header()
         return raw_response
 
-    # 3. L1 EXACT-MATCH FAST PATH
+    # 4. L1 EXACT-MATCH (Tenant Partitioned)
     exact_key = ExactMatchCache.generate_exact_key(
         prompt=user_prompt,
         model=request.model,
         system_prompt_hash=sys_hash,
         params_hash=p_hash,
         context_hash=c_hash,
+        tenant_id=x_tenant_id,
     )
     profiler.start("l1_exact")
     l1_cached = exact_cache.lookup(exact_key)
@@ -152,9 +179,8 @@ async def chat_completions(
         response.headers["Server-Timing"] = profiler.to_server_timing_header()
         return l1_cached
 
-    # 4. L2 SEMANTIC VECTOR CACHE
+    # 5. L2 SEMANTIC VECTOR CACHE (Tenant Filtered)
     profiler.start("l2_semantic")
-    # Pass c_hash from multi-turn context
     vector = await cache.embedder.get_embedding(user_prompt)
     match = cache.reader.query_similarity(
         vector=vector,
@@ -162,7 +188,8 @@ async def chat_completions(
         system_prompt_hash=sys_hash,
         params_hash=p_hash,
         context_hash=c_hash,
-        similarity_threshold=x_similarity_threshold,
+        tenant_id=x_tenant_id,
+        similarity_threshold=active_threshold,
         raw_prompt=user_prompt,
     )
     profiler.stop("l2_semantic")
@@ -176,8 +203,8 @@ async def chat_completions(
         from app.api.admin import drift_tracker
         drift_tracker.record_hit_similarity(similarity_score)
 
-        cache.reader.extend_key_ttl(entry_key)
-        exact_cache.store_exact(exact_key, resp_data)
+        cache.reader.extend_key_ttl(entry_key, extension_seconds=tenant_cfg.max_ttl_seconds)
+        exact_cache.store_exact(exact_key, resp_data, ttl_seconds=tenant_cfg.max_ttl_seconds)
 
         if x_session_id and x_turn_index is not None:
             session_manager.record_turn(x_session_id, x_turn_index, entry_key)
@@ -185,8 +212,7 @@ async def chat_completions(
         if request.stream:
             return StreamingResponse(
                 StreamingUtils.replay_cached_stream(
-                    cached_response=resp_data,
-                    model=request.model,
+                    cached_response=resp_data, model=request.model
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -207,9 +233,9 @@ async def chat_completions(
         response.headers["Server-Timing"] = profiler.to_server_timing_header()
         return resp_data
 
-    # 5. CACHE MISS with Anti-Stampede Barrier
+    # 6. CACHE MISS with Anti-Stampede Barrier
     payload = request.model_dump(exclude_none=True)
-    stampede_key = f"{p_hash}:{sys_hash}:{c_hash}"
+    stampede_key = f"{x_tenant_id}:{p_hash}:{sys_hash}:{c_hash}"
     is_leader, lock_token = await cache_lock.acquire_lock(stampede_key)
 
     try:
@@ -230,7 +256,8 @@ async def chat_completions(
                 system_prompt_hash=sys_hash,
                 params_hash=p_hash,
                 context_hash=c_hash,
-                similarity_threshold=x_similarity_threshold,
+                tenant_id=x_tenant_id,
+                similarity_threshold=active_threshold,
                 raw_prompt=user_prompt,
             )
             if retry_match:
@@ -259,9 +286,14 @@ async def chat_completions(
                         assembled_data = full_payload
 
                 if assembled_data:
+                    _, _, total_tokens = TokenCostCalculator.extract_tokens(assembled_data)
+                    budget_guardrail.record_usage(x_tenant_id, total_tokens)
+
                     safe, _ = CacheSecurityGuardrail.is_cacheable(user_prompt, assembled_data)
                     if safe:
-                        ttl = NegativeCachePolicy.get_adaptive_ttl(assembled_data, 86400)
+                        ttl = NegativeCachePolicy.get_adaptive_ttl(
+                            assembled_data, tenant_cfg.max_ttl_seconds
+                        )
                         stored_key = cache.store(
                             prompt=user_prompt,
                             vector=vector,
@@ -270,6 +302,7 @@ async def chat_completions(
                             system_prompt_hash=sys_hash,
                             params_hash=p_hash,
                             context_hash=c_hash,
+                            tenant_id=x_tenant_id,
                             ttl_seconds=ttl,
                         )
                         exact_cache.store_exact(exact_key, assembled_data, ttl_seconds=ttl)
@@ -298,9 +331,13 @@ async def chat_completions(
         telemetry.record_miss(latency_ms=total_lat)
         sla_tracker.record_latency(is_hit=False, latency_ms=total_lat)
 
+        # Record quota consumption
+        _, _, total_tokens = TokenCostCalculator.extract_tokens(raw_response)
+        budget_guardrail.record_usage(x_tenant_id, total_tokens)
+
         safe, _ = CacheSecurityGuardrail.is_cacheable(user_prompt, raw_response)
         if safe:
-            ttl = NegativeCachePolicy.get_adaptive_ttl(raw_response, 86400)
+            ttl = NegativeCachePolicy.get_adaptive_ttl(raw_response, tenant_cfg.max_ttl_seconds)
             stored_key = cache.store(
                 prompt=user_prompt,
                 vector=vector,
@@ -309,6 +346,7 @@ async def chat_completions(
                 system_prompt_hash=sys_hash,
                 params_hash=p_hash,
                 context_hash=c_hash,
+                tenant_id=x_tenant_id,
                 ttl_seconds=ttl,
             )
             exact_cache.store_exact(exact_key, raw_response, ttl_seconds=ttl)
