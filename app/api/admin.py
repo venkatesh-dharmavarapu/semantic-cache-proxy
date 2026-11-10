@@ -5,6 +5,102 @@ from app.api.proxy import session_manager
 from app.core.drift_detector import SemanticDriftTracker
 from app.core.feedback_manager import FeedbackManager
 from app.core.tenant_policy import TenantPurgeService
+from app.api.proxy import event_mesh
+from app.schemas.event_models import InvalidationScope
+
+
+@router.delete("/cache/tenants/{tenant_id}", status_code=status.HTTP_200_OK)
+async def purge_tenant_cache(tenant_id: str):
+    client = cache.vector_store.client
+    if not client:
+        return {"status": "error", "message": "Redis client not connected"}
+
+    purged_count = TenantPurgeService.purge_tenant_namespace(client, tenant_id)
+    # Broadcast tenant purge to mesh
+    await event_mesh.publish_event(
+        scope=InvalidationScope.TENANT_PURGED,
+        target=tenant_id,
+        metadata={"purged_count": purged_count},
+    )
+    return {
+        "status": "success",
+        "tenant_id": tenant_id,
+        "purged_keys_count": purged_count,
+        "message": f"Tenant '{tenant_id}' namespace successfully cleared.",
+    }
+
+
+@router.post("/cache/threshold/tune", status_code=status.HTTP_200_OK)
+async def tune_dynamic_threshold(target_confidence: float = Body(default=0.88, embed=True)):
+    stats = drift_tracker.get_distribution_stats()
+    if stats["sample_count"] < 5:
+        return {
+            "status": "insufficient_data",
+            "current_threshold": cache.similarity_threshold,
+            "recommended_threshold": cache.similarity_threshold,
+        }
+
+    mean_val = stats["mean"]
+    std_dev = stats["std_dev"]
+    recommended = round(max(0.78, min(0.95, mean_val - (std_dev * 1.5))), 4)
+    cache.similarity_threshold = recommended
+
+    # Broadcast threshold change to all instances
+    await event_mesh.publish_event(
+        scope=InvalidationScope.THRESHOLD_UPDATED,
+        target="global",
+        metadata={"new_threshold": recommended},
+    )
+
+    return {
+        "status": "updated",
+        "sample_count": stats["sample_count"],
+        "mean_similarity": mean_val,
+        "new_threshold": recommended,
+    }
+
+
+@router.delete("/cache/purge", status_code=status.HTTP_200_OK)
+async def purge_cache(
+    model: Optional[str] = Query(default=None, description="Purge entries strictly for a model tag"),
+    flush_all: bool = Query(default=False, description="Purge all entries in the cache index"),
+):
+    client = cache.vector_store.client
+    if not client:
+        return {"status": "error", "message": "Vector store client not connected"}
+
+    purged_count = 0
+
+    if flush_all:
+        for key in client.scan_iter("cache:*"):
+            client.delete(key)
+            purged_count += 1
+        await event_mesh.publish_event(scope=InvalidationScope.FLUSH_ALL, target="all")
+        return {
+            "status": "success",
+            "message": "Entire cache flushed successfully",
+            "purged_count": purged_count,
+        }
+
+    if model:
+        for key in client.scan_iter("cache:llm:*"):
+            stored_model = client.hget(key, "model")
+            if stored_model and stored_model.decode("utf-8") == model:
+                client.delete(key)
+                purged_count += 1
+        await event_mesh.publish_event(scope=InvalidationScope.MODEL_PURGED, target=model)
+        return {
+            "status": "success",
+            "message": f"Cache entries for model '{model}' purged",
+            "purged_count": purged_count,
+        }
+
+    return {
+        "status": "ignored",
+        "message": "Specify either 'model' or 'flush_all=true' to execute purge",
+        "purged_count": 0,
+    }
+
 from app.schemas.feedback_models import (
     FeedbackStatsResponse,
     FeedbackSubmitRequest,
