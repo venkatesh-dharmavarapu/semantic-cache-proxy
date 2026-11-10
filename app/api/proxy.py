@@ -20,6 +20,22 @@ from app.core.telemetry import TelemetryTracker
 from app.core.tenant_policy import TenantPolicyManager
 from app.schemas.chat_models import ChatCompletionRequest
 from app.services.llm_client import LLMClient
+# Add imports
+from app.core.event_mesh import DistributedEventMesh
+from app.schemas.event_models import CacheInvalidationEvent, InvalidationScope
+
+# Initialize mesh
+event_mesh = DistributedEventMesh()
+
+# Register local sync callback
+def handle_remote_threshold_update(event: CacheInvalidationEvent):
+    new_threshold = event.metadata.get("new_threshold")
+    if new_threshold:
+        cache.similarity_threshold = float(new_threshold)
+
+event_mesh.register_handler(
+    InvalidationScope.THRESHOLD_UPDATED, handle_remote_threshold_update
+)
 
 router = APIRouter(prefix="/v1", tags=["Chat Proxy"])
 
