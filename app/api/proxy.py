@@ -1,6 +1,8 @@
 import time
+from urllib import request
 from fastapi import APIRouter, Header, Request, Response
 from fastapi.responses import StreamingResponse
+from app.core import profiler
 from app.core.budget_guardrail import TenantBudgetGuardrail
 from app.core.context_normalizer import ContextNormalizer
 from app.core.cost_calculator import TokenCostCalculator
@@ -20,9 +22,10 @@ from app.core.telemetry import TelemetryTracker
 from app.core.tenant_policy import TenantPolicyManager
 from app.schemas.chat_models import ChatCompletionRequest
 from app.services.llm_client import LLMClient
-# Add imports
 from app.core.event_mesh import DistributedEventMesh
 from app.schemas.event_models import CacheInvalidationEvent, InvalidationScope
+from app.core.metrics import MetricsRecorder
+from app.core.tracer import W3CTraceContext
 
 # Initialize mesh
 event_mesh = DistributedEventMesh()
@@ -136,7 +139,13 @@ async def chat_completions(
             )
 
         profiler.start("upstream")
-        raw_response = await llm_client.forward_chat_completion(payload)
+        child_trace = trace_ctx.child_context()
+        raw_response = await llm_client.forward_chat_completion(payload, traceparent=child_trace.to_header())
+        total_lat = profiler.total_elapsed_ms()
+        tier_lbl = "BYPASS" if x_cache_bypass else "NONE"
+        status_lbl = "BYPASS" if x_cache_bypass else "MISS"
+        MetricsRecorder.record_request(tier=tier_lbl, status=status_lbl, tenant_id=x_tenant_id, model=request.model)
+        MetricsRecorder.record_latency(stage="upstream", tier=tier_lbl, latency_seconds=total_lat / 1000.0)
         profiler.stop("upstream")
 
         # Track token consumption against budget
@@ -165,6 +174,11 @@ async def chat_completions(
 
     if l1_cached:
         total_lat = profiler.total_elapsed_ms()
+        MetricsRecorder.record_request(tier="L1-EXACT", status="HIT", tenant_id=x_tenant_id, model=request.model)
+        MetricsRecorder.record_latency(stage="l1_exact", tier="L1-EXACT", latency_seconds=total_lat / 1000.0)
+        p_tok, c_tok, t_tok = TokenCostCalculator.extract_tokens(l1_cached)
+        cost_saved = TokenCostCalculator.estimate_cost(request.model, p_tok, c_tok)
+        MetricsRecorder.record_savings(tenant_id=x_tenant_id, model=request.model, prompt_tokens=p_tok, completion_tokens=c_tok, estimated_cost_usd=cost_saved)
         telemetry.record_hit(latency_ms=total_lat)
         sla_tracker.record_latency(is_hit=True, latency_ms=total_lat)
 
@@ -213,6 +227,12 @@ async def chat_completions(
     if match:
         resp_data, similarity_score, entry_key = match
         total_lat = profiler.total_elapsed_ms()
+        MetricsRecorder.record_request(tier="L2-SEMANTIC", status="HIT", tenant_id=x_tenant_id, model=request.model)
+        MetricsRecorder.record_latency(stage="l2_semantic", tier="L2-SEMANTIC", latency_seconds=total_lat / 1000.0)
+        MetricsRecorder.record_similarity(tenant_id=x_tenant_id, model=request.model, score=similarity_score)
+        p_tok, c_tok, t_tok = TokenCostCalculator.extract_tokens(resp_data)
+        cost_saved = TokenCostCalculator.estimate_cost(request.model, p_tok, c_tok)
+        MetricsRecorder.record_savings(tenant_id=x_tenant_id, model=request.model, prompt_tokens=p_tok, completion_tokens=c_tok, estimated_cost_usd=cost_saved)
         telemetry.record_hit(latency_ms=total_lat)
         sla_tracker.record_latency(is_hit=True, latency_ms=total_lat)
 
@@ -340,7 +360,13 @@ async def chat_completions(
             )
 
         profiler.start("upstream")
-        raw_response = await llm_client.forward_chat_completion(payload)
+        child_trace = trace_ctx.child_context()
+        raw_response = await llm_client.forward_chat_completion(payload, traceparent=child_trace.to_header())
+        total_lat = profiler.total_elapsed_ms()
+        tier_lbl = "BYPASS" if x_cache_bypass else "NONE"
+        status_lbl = "BYPASS" if x_cache_bypass else "MISS"
+        MetricsRecorder.record_request(tier=tier_lbl, status=status_lbl, tenant_id=x_tenant_id, model=request.model)
+        MetricsRecorder.record_latency(stage="upstream", tier=tier_lbl, latency_seconds=total_lat / 1000.0)
         profiler.stop("upstream")
 
         total_lat = profiler.total_elapsed_ms()
