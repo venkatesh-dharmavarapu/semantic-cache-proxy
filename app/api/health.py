@@ -3,9 +3,23 @@ from fastapi.responses import JSONResponse
 import httpx
 from app.config import settings
 from app.core.vector_store import VectorStoreManager
+from fastapi import APIRouter, Response, status
+from app.core.metrics import MetricsRecorder
 
-router = APIRouter(prefix="/health", tags=["Health"])
+router = APIRouter(tags=["Health & Telemetry"])
 store = VectorStoreManager()
+
+
+@router.get("/health", status_code=status.HTTP_200_OK)
+def health_check():
+    return {"status": "healthy"}
+
+
+@router.get("/metrics", status_code=status.HTTP_200_OK)
+def prometheus_metrics():
+    """Scrapes system and cache telemetrics in OpenMetrics exposition format."""
+    data, content_type = MetricsRecorder.export_metrics()
+    return Response(content=data, media_type=content_type)
 
 
 @router.get("/live", status_code=status.HTTP_200_OK)
