@@ -125,3 +125,18 @@ class LLMClient:
 
         # Final yield emitting the complete payload for caching
         yield "", assembled_payload
+
+    async def forward_chat_completion(
+        self,
+        payload: Dict[str, Any],
+        traceparent: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if traceparent:
+            headers["traceparent"] = traceparent
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.json()
