@@ -1,0 +1,88 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Cache Hit Ratio (L1 vs L2)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(semantic_cache_requests_total{status='HIT'}[5m])) / sum(rate(semantic_cache_requests_total[5m])) * 100",
+          "legendFormat": "Global Hit Rate %"
+        },
+        {
+          "expr": "sum(rate(semantic_cache_requests_total{tier='L1-EXACT', status='HIT'}[5m])) / sum(rate(semantic_cache_requests_total[5m])) * 100",
+          "legendFormat": "L1 Exact Hit %"
+        },
+        {
+          "expr": "sum(rate(semantic_cache_requests_total{tier='L2-SEMANTIC', status='HIT'}[5m])) / sum(rate(semantic_cache_requests_total[5m])) * 100",
+          "legendFormat": "L2 Semantic Hit %"
+        }
+      ]
+    },
+    {
+      "title": "Latency Percentiles (P50, P90, P99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(semantic_cache_lookup_latency_seconds_bucket[5m])) by (le)) * 1000",
+          "legendFormat": "P50 Latency (ms)"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(semantic_cache_lookup_latency_seconds_bucket[5m])) by (le)) * 1000",
+          "legendFormat": "P90 Latency (ms)"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(semantic_cache_lookup_latency_seconds_bucket[5m])) by (le)) * 1000",
+          "legendFormat": "P99 Latency (ms)"
+        }
+      ]
+    },
+    {
+      "title": "Accumulated Financial Savings ($ USD)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(semantic_cache_cost_savings_usd_total)",
+          "legendFormat": "Total Saved"
+        }
+      ]
+    },
+    {
+      "title": "Total Tokens Saved",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(semantic_cache_tokens_saved_total)",
+          "legendFormat": "Tokens Avoided"
+        }
+      ]
+    },
+    {
+      "title": "Semantic Similarity Distribution (L2 Hits)",
+      "type": "histogram",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "rate(semantic_cache_similarity_score_sum[5m]) / rate(semantic_cache_similarity_score_count[5m])",
+          "legendFormat": "Avg Similarity Score"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["semantic-cache", "llm-gateway", "prometheus"],
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "LLM Semantic Cache Proxy - APM & Telemetry",
+  "uid": "llm-semantic-cache-apm"
+}
