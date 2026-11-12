@@ -26,6 +26,55 @@ from app.core.event_mesh import DistributedEventMesh
 from app.schemas.event_models import CacheInvalidationEvent, InvalidationScope
 from app.core.metrics import MetricsRecorder
 from app.core.tracer import W3CTraceContext
+import asyncio
+from app.core.mutex_lease import MutexLeaseManager
+from app.core.xfetch import XFetchEngine
+
+mutex_lease = MutexLeaseManager(cache.vector_store)
+
+
+async def _async_revalidate_upstream(
+    payload: dict,
+    exact_key: str,
+    user_prompt: str,
+    vector: list[float],
+    sys_hash: str,
+    p_hash: str,
+    c_hash: str,
+    x_tenant_id: str,
+    model: str,
+    max_ttl: int,
+    lease_token: str,
+):
+    """Background worker executing recomputation without delaying user thread."""
+    start_t = time.perf_counter()
+    try:
+        fresh_response = await llm_client.forward_chat_completion(payload)
+        delta = time.perf_counter() - start_t
+        safe, _ = CacheSecurityGuardrail.is_cacheable(user_prompt, fresh_response)
+        if safe:
+            ttl = NegativeCachePolicy.get_adaptive_ttl(fresh_response, max_ttl)
+            cache.store(
+                prompt=user_prompt,
+                vector=vector,
+                response_data=fresh_response,
+                model=model,
+                system_prompt_hash=sys_hash,
+                params_hash=p_hash,
+                context_hash=c_hash,
+                tenant_id=x_tenant_id,
+                ttl_seconds=ttl,
+            )
+            exact_cache.store_exact(
+                exact_key,
+                fresh_response,
+                ttl_seconds=ttl,
+                compute_delta=delta,
+            )
+    except Exception as exc:
+        logger.error("Background XFetch revalidation failed: %s", exc)
+    finally:
+        mutex_lease.release_lease(exact_key, lease_token)
 
 # Initialize mesh
 event_mesh = DistributedEventMesh()
@@ -159,7 +208,7 @@ async def chat_completions(
         response.headers["Server-Timing"] = profiler.to_server_timing_header()
         return raw_response
 
-    # 4. L1 EXACT-MATCH (Tenant Partitioned)
+# 4. L1 EXACT-MATCH FAST PATH with XFetch
     exact_key = ExactMatchCache.generate_exact_key(
         prompt=user_prompt,
         model=request.model,
@@ -169,38 +218,35 @@ async def chat_completions(
         tenant_id=x_tenant_id,
     )
     profiler.start("l1_exact")
-    l1_cached = exact_cache.lookup(exact_key)
+    l1_result = exact_cache.lookup(exact_key)
     profiler.stop("l1_exact")
 
-    if l1_cached:
+    if l1_result:
+        l1_cached, ttl_remaining, compute_delta = l1_result
         total_lat = profiler.total_elapsed_ms()
-        MetricsRecorder.record_request(tier="L1-EXACT", status="HIT", tenant_id=x_tenant_id, model=request.model)
-        MetricsRecorder.record_latency(stage="l1_exact", tier="L1-EXACT", latency_seconds=total_lat / 1000.0)
-        p_tok, c_tok, t_tok = TokenCostCalculator.extract_tokens(l1_cached)
-        cost_saved = TokenCostCalculator.estimate_cost(request.model, p_tok, c_tok)
-        MetricsRecorder.record_savings(tenant_id=x_tenant_id, model=request.model, prompt_tokens=p_tok, completion_tokens=c_tok, estimated_cost_usd=cost_saved)
         telemetry.record_hit(latency_ms=total_lat)
         sla_tracker.record_latency(is_hit=True, latency_ms=total_lat)
+        MetricsRecorder.record_request(tier="L1-EXACT", status="HIT", tenant_id=x_tenant_id, model=request.model)
 
-        if x_session_id and x_turn_index is not None:
-            session_manager.record_turn(x_session_id, x_turn_index, exact_key)
-
-        if request.stream:
-            return StreamingResponse(
-                StreamingUtils.replay_cached_stream(
-                    cached_response=l1_cached, model=request.model
-                ),
-                media_type="text/event-stream",
-                headers={
-                    "X-Cache-Lookup": "HIT",
-                    "X-Cache-Tier": "L1-EXACT",
-                    "X-Cache-Similarity": "1.0000",
-                    "X-Lookup-Latency-ms": f"{total_lat:.2f}",
-                    "Server-Timing": profiler.to_server_timing_header(),
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                },
-            )
+        # Evaluate XFetch early refresh
+        if XFetchEngine.should_refresh_early(ttl_remaining, compute_delta):
+            acquired, lease_tok = mutex_lease.try_acquire_lease(exact_key)
+            if acquired:
+                asyncio.create_task(
+                    _async_revalidate_upstream(
+                        payload=request.model_dump(exclude_none=True),
+                        exact_key=exact_key,
+                        user_prompt=user_prompt,
+                        vector=await cache.embedder.get_embedding(user_prompt),
+                        sys_hash=sys_hash,
+                        p_hash=p_hash,
+                        c_hash=c_hash,
+                        x_tenant_id=x_tenant_id,
+                        model=request.model,
+                        max_ttl=tenant_cfg.max_ttl_seconds,
+                        lease_token=lease_tok,
+                    )
+                )
 
         response.headers["X-Cache-Lookup"] = "HIT"
         response.headers["X-Cache-Tier"] = "L1-EXACT"
