@@ -29,6 +29,12 @@ from app.core.tracer import W3CTraceContext
 import asyncio
 from app.core.mutex_lease import MutexLeaseManager
 from app.core.xfetch import XFetchEngine
+from app.services.fallback_dispatcher import (
+    UpstreamFallbackDispatcher,
+    UpstreamServiceUnavailableError,
+)
+
+fallback_dispatcher = UpstreamFallbackDispatcher(llm_client, cache.vector_store)
 
 mutex_lease = MutexLeaseManager(cache.vector_store)
 
@@ -315,116 +321,67 @@ async def chat_completions(
         response.headers["Server-Timing"] = profiler.to_server_timing_header()
         return resp_data
 
-    # 6. CACHE MISS with Anti-Stampede Barrier
-    payload = request.model_dump(exclude_none=True)
-    stampede_key = f"{x_tenant_id}:{p_hash}:{sys_hash}:{c_hash}"
-    is_leader, lock_token = await cache_lock.acquire_lock(stampede_key)
+# 6. CACHE MISS with Anti-Stampede Barrier & Upstream Fallback
+        
+    fallback_chain = ["llama3.2:1b", "llama3.2:3b", "fallback-ha-model"]
 
     try:
-        if not is_leader:
-            retry_l1 = exact_cache.lookup(exact_key)
-            if retry_l1:
-                total_lat = profiler.total_elapsed_ms()
-                response.headers["X-Cache-Lookup"] = "HIT"
-                response.headers["X-Cache-Tier"] = "L1-EXACT"
-                response.headers["X-Cache-Similarity"] = "1.0000"
-                response.headers["X-Lookup-Latency-ms"] = f"{total_lat:.2f}"
-                response.headers["Server-Timing"] = profiler.to_server_timing_header()
-                return retry_l1
+            profiler.start("upstream")
+            raw_response, serving_model = await fallback_dispatcher.execute_with_fallback(
+                payload=payload,
+                fallback_models=fallback_chain,
+                traceparent=child_trace.to_header(),
+            )
+            profiler.stop("upstream")
+    except UpstreamServiceUnavailableError as upstream_err:
+            # Stale-While-Revalidate Salvage: Check if any L1/L2 entry exists
+            stale_l1 = exact_cache.lookup(exact_key)
+            if stale_l1:
+                stale_data, _, _ = stale_l1
+                response.headers["X-Cache-Lookup"] = "HIT-STALE-FALLBACK"
+                response.headers["X-Cache-Tier"] = "L1-STALE"
+                response.headers["X-Upstream-Degraded"] = "true"
+                return stale_data
 
-            retry_match = cache.reader.query_similarity(
+            stale_l2 = cache.reader.query_similarity(
                 vector=vector,
                 model=request.model,
                 system_prompt_hash=sys_hash,
                 params_hash=p_hash,
                 context_hash=c_hash,
                 tenant_id=x_tenant_id,
-                similarity_threshold=active_threshold,
+                similarity_threshold=0.75,  # Relaxed emergency fallback threshold
                 raw_prompt=user_prompt,
             )
-            if retry_match:
-                r_data, r_sim, r_key = retry_match
-                total_lat = profiler.total_elapsed_ms()
-                telemetry.record_hit(latency_ms=total_lat)
-                sla_tracker.record_latency(is_hit=True, latency_ms=total_lat)
-                response.headers["X-Cache-Lookup"] = "HIT"
-                response.headers["X-Cache-Tier"] = "L2-SEMANTIC"
-                response.headers["X-Cache-Similarity"] = f"{r_sim:.4f}"
-                response.headers["X-Lookup-Latency-ms"] = f"{total_lat:.2f}"
-                response.headers["Server-Timing"] = profiler.to_server_timing_header()
-                return r_data
+            if stale_l2:
+                stale_resp, sim_score, _ = stale_l2
+                response.headers["X-Cache-Lookup"] = "HIT-STALE-FALLBACK"
+                response.headers["X-Cache-Tier"] = "L2-STALE"
+                response.headers["X-Upstream-Degraded"] = "true"
+                return stale_resp
 
-        if request.stream:
-            total_lat = profiler.total_elapsed_ms()
-            telemetry.record_miss(latency_ms=total_lat)
-            sla_tracker.record_latency(is_hit=False, latency_ms=total_lat)
-
-            async def stream_and_cache_generator():
-                assembled_data = None
-                async for chunk_str, full_payload in llm_client.stream_chat_completion(payload):
-                    if chunk_str:
-                        yield chunk_str
-                    if full_payload:
-                        assembled_data = full_payload
-
-                if assembled_data:
-                    _, _, total_tokens = TokenCostCalculator.extract_tokens(assembled_data)
-                    budget_guardrail.record_usage(x_tenant_id, total_tokens)
-
-                    safe, _ = CacheSecurityGuardrail.is_cacheable(user_prompt, assembled_data)
-                    if safe:
-                        ttl = NegativeCachePolicy.get_adaptive_ttl(
-                            assembled_data, tenant_cfg.max_ttl_seconds
-                        )
-                        stored_key = cache.store(
-                            prompt=user_prompt,
-                            vector=vector,
-                            response_data=assembled_data,
-                            model=request.model,
-                            system_prompt_hash=sys_hash,
-                            params_hash=p_hash,
-                            context_hash=c_hash,
-                            tenant_id=x_tenant_id,
-                            ttl_seconds=ttl,
-                        )
-                        exact_cache.store_exact(exact_key, assembled_data, ttl_seconds=ttl)
-                        if x_session_id and x_turn_index is not None:
-                            session_manager.record_turn(x_session_id, x_turn_index, stored_key)
-
-            return StreamingResponse(
-                stream_and_cache_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "X-Cache-Lookup": "MISS",
-                    "X-Cache-Tier": "NONE",
-                    "X-Cache-Similarity": "0.0",
-                    "X-Lookup-Latency-ms": f"{total_lat:.2f}",
-                    "Server-Timing": profiler.to_server_timing_header(),
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                },
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=503,
+                detail=f"Service unavailable: all upstream providers failed. {upstream_err}",
             )
 
-        profiler.start("upstream")
-        child_trace = trace_ctx.child_context()
-        raw_response = await llm_client.forward_chat_completion(payload, traceparent=child_trace.to_header())
-        total_lat = profiler.total_elapsed_ms()
-        tier_lbl = "BYPASS" if x_cache_bypass else "NONE"
-        status_lbl = "BYPASS" if x_cache_bypass else "MISS"
-        MetricsRecorder.record_request(tier=tier_lbl, status=status_lbl, tenant_id=x_tenant_id, model=request.model)
-        MetricsRecorder.record_latency(stage="upstream", tier=tier_lbl, latency_seconds=total_lat / 1000.0)
-        profiler.stop("upstream")
+    total_lat = profiler.total_elapsed_ms()
+    telemetry.record_miss(latency_ms=total_lat)
+    sla_tracker.record_latency(is_hit=False, latency_ms=total_lat)
+    MetricsRecorder.record_request(
+            tier="NONE",
+            status="MISS",
+            tenant_id=x_tenant_id,
+            model=serving_model,
+        )
 
-        total_lat = profiler.total_elapsed_ms()
-        telemetry.record_miss(latency_ms=total_lat)
-        sla_tracker.record_latency(is_hit=False, latency_ms=total_lat)
+    if serving_model != request.model:
+            response.headers["X-Upstream-Fallback"] = "true"
+            response.headers["X-Serving-Model"] = serving_model
 
-        # Record quota consumption
-        _, _, total_tokens = TokenCostCalculator.extract_tokens(raw_response)
-        budget_guardrail.record_usage(x_tenant_id, total_tokens)
-
-        safe, _ = CacheSecurityGuardrail.is_cacheable(user_prompt, raw_response)
-        if safe:
+    safe, _ = CacheSecurityGuardrail.is_cacheable(user_prompt, raw_response)
+    if safe:
             ttl = NegativeCachePolicy.get_adaptive_ttl(raw_response, tenant_cfg.max_ttl_seconds)
             stored_key = cache.store(
                 prompt=user_prompt,
@@ -437,16 +394,18 @@ async def chat_completions(
                 tenant_id=x_tenant_id,
                 ttl_seconds=ttl,
             )
-            exact_cache.store_exact(exact_key, raw_response, ttl_seconds=ttl)
+            exact_cache.store_exact(
+                exact_key,
+                raw_response,
+                ttl_seconds=ttl,
+                compute_delta=total_lat / 1000.0,
+            )
             if x_session_id and x_turn_index is not None:
                 session_manager.record_turn(x_session_id, x_turn_index, stored_key)
 
-        response.headers["X-Cache-Lookup"] = "MISS"
-        response.headers["X-Cache-Tier"] = "NONE"
-        response.headers["X-Cache-Similarity"] = "0.0"
-        response.headers["X-Lookup-Latency-ms"] = f"{total_lat:.2f}"
-        response.headers["Server-Timing"] = profiler.to_server_timing_header()
-        return raw_response
-    finally:
-        if is_leader and lock_token:
-            cache_lock.release_lock(stampede_key, lock_token)
+    response.headers["X-Cache-Lookup"] = "MISS"
+    response.headers["X-Cache-Tier"] = "NONE"
+    response.headers["X-Cache-Similarity"] = "0.0"
+    response.headers["X-Lookup-Latency-ms"] = f"{total_lat:.2f}"
+    response.headers["Server-Timing"] = profiler.to_server_timing_header()
+    return raw_response
