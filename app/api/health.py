@@ -1,18 +1,48 @@
-from fastapi import APIRouter, status
-from fastapi.responses import JSONResponse
-import httpx
-from app.config import settings
-from app.core.vector_store import VectorStoreManager
 from fastapi import APIRouter, Response, status
 from app.core.metrics import MetricsRecorder
 
 router = APIRouter(tags=["Health & Telemetry"])
-store = VectorStoreManager()
+
+# Global application lifecycle state
+class AppLifecycleState:
+    is_ready: bool = True
+    is_draining: bool = False
+
+lifecycle_state = AppLifecycleState()
 
 
 @router.get("/health", status_code=status.HTTP_200_OK)
-def health_check():
+def legacy_health():
     return {"status": "healthy"}
+
+
+@router.get("/health/live", status_code=status.HTTP_200_OK)
+def liveness_probe():
+    """Liveness probe: returns 200 as long as the process is alive."""
+    return {"status": "alive"}
+
+
+@router.get("/health/ready")
+def readiness_probe(response: Response):
+    """
+    Readiness probe: asserts Redis connectivity and ensures
+    the instance is not currently draining connections.
+    """
+    if lifecycle_state.is_draining or not lifecycle_state.is_ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "draining", "ready": False}
+
+    try:
+        from app.api.proxy import cache
+        client = cache.vector_store.client
+        if client and client.ping():
+            return {"status": "ready", "ready": True}
+    except Exception as exc:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "unhealthy", "ready": False, "error": str(exc)}
+
+    response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"status": "not_connected", "ready": False}
 
 
 @router.get("/metrics", status_code=status.HTTP_200_OK)
@@ -20,52 +50,3 @@ def prometheus_metrics():
     """Scrapes system and cache telemetrics in OpenMetrics exposition format."""
     data, content_type = MetricsRecorder.export_metrics()
     return Response(content=data, media_type=content_type)
-
-
-@router.get("/live", status_code=status.HTTP_200_OK)
-def liveness_probe():
-    """Shallow probe indicating proxy process is active."""
-    return {"status": "alive"}
-
-
-@router.get("/ready")
-async def readiness_probe():
-    """
-    Deep readiness check inspecting:
-    1. Redis Stack connection and index presence.
-    2. Ollama embedding server responsiveness.
-    """
-    checks = {"redis": False, "ollama": False, "index_ready": False}
-    status_code = status.HTTP_200_OK
-
-    # 1. Verify Redis Connection & Index
-    try:
-        store.connect()
-        if store.client and store.client.ping():
-            checks["redis"] = True
-            indices = store.client.execute_command("FT._LIST")
-            decoded_indices = [idx.decode("utf-8") if isinstance(idx, bytes) else idx for idx in indices]
-            if settings.CACHE_INDEX_NAME in decoded_indices:
-                checks["index_ready"] = True
-    except Exception:
-        checks["redis"] = False
-
-    # 2. Verify Ollama Service
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags")
-            if resp.status_code == 200:
-                checks["ollama"] = True
-    except Exception:
-        checks["ollama"] = False
-
-    if not all(checks.values()):
-        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "ready" if status_code == 200 else "unhealthy",
-            "dependencies": checks,
-        },
-    )
