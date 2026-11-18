@@ -1,6 +1,7 @@
 import hashlib
 import json
 from typing import Any, Dict, List, Tuple
+from app.core.context_compactor import ContextCompactor
 
 
 class ContextNormalizer:
@@ -11,25 +12,33 @@ class ContextNormalizer:
         cls,
         messages: List[Dict[str, Any]],
         window_size: int = DEFAULT_WINDOW_TURNS,
-    ) -> Tuple[List[Dict[str, Any]], str, str]:
+        compact_threshold_tokens: int = 2048,
+    ) -> Tuple[List[Dict[str, Any]], str, str, bool, int]:
         """
         Partitions message history into:
         1. local_window: The last N prior messages.
         2. history_digest: SHA-256 digest of messages preceding the local window, or 'stateless'/'root'.
         3. current_prompt: The final user message content.
+        4. was_compacted: Whether context compaction was triggered.
+        5. tokens_saved: Estimated token reduction count.
         """
         if not messages:
-            return [], "stateless", ""
+            return [], "stateless", "", False, 0
 
-        chat_turns = [m for m in messages if m.get("role") != "system"]
+        # 1. Apply compaction if context footprint is large
+        compacted_messages, was_compacted, saved_tokens = ContextCompactor.compact_messages(
+            messages, max_context_tokens=compact_threshold_tokens
+        )
+
+        chat_turns = [m for m in compacted_messages if m.get("role") != "system"]
         if not chat_turns:
-            return [], "stateless", ""
+            return [], "stateless", "", was_compacted, saved_tokens
 
         current_prompt = chat_turns[-1].get("content", "").strip()
         prior_turns = chat_turns[:-1]
 
         if not prior_turns:
-            return [], "stateless", current_prompt
+            return [], "stateless", current_prompt, was_compacted, saved_tokens
 
         if len(prior_turns) <= window_size:
             local_window = prior_turns
@@ -41,7 +50,7 @@ class ContextNormalizer:
             raw_history_str = json.dumps(older_history, sort_keys=True)
             history_digest = hashlib.sha256(raw_history_str.encode("utf-8")).hexdigest()[:16]
 
-        return local_window, history_digest, current_prompt
+        return local_window, history_digest, current_prompt, was_compacted, saved_tokens
 
     @classmethod
     def compute_turn_context_hash(
@@ -49,11 +58,6 @@ class ContextNormalizer:
         local_window: List[Dict[str, Any]],
         history_digest: str,
     ) -> str:
-        """
-        Computes a deterministic hash for multi-turn local dialogue state.
-        For standalone single-turn messages (empty window and stateless history),
-        it returns 'stateless' to remain compatible with pre-warmed & migrated entries.
-        """
         if not local_window and history_digest in ("stateless", "empty"):
             return "stateless"
 
