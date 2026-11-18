@@ -156,7 +156,14 @@ async def chat_completions(
     serialized_messages = [msg.model_dump() for msg in request.messages]
     user_prompt, system_prompt = cache._extract_prompt_and_system(serialized_messages)
 
-    local_window, history_digest, _ = ContextNormalizer.partition_context(serialized_messages)
+    # Multi-turn partition with adaptive compaction
+    (
+        local_window,
+        history_digest,
+        _,
+        was_compacted,
+        tokens_saved,
+    ) = ContextNormalizer.partition_context(serialized_messages)
     c_hash = ContextNormalizer.compute_turn_context_hash(local_window, history_digest)
 
     sys_hash = CacheKeyHasher.hash_system_prompt(system_prompt)
@@ -165,8 +172,9 @@ async def chat_completions(
     )
     profiler.stop("hash")
 
-    # Dynamic similarity threshold: explicit header > tenant policy default
-    active_threshold = x_similarity_threshold or tenant_cfg.similarity_threshold
+    if was_compacted:
+        response.headers["X-Context-Compacted"] = "true"
+        response.headers["X-Tokens-Compacted"] = str(tokens_saved)
 
     # 3. Explicit Cache Bypass
     if x_cache_bypass:
