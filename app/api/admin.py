@@ -7,6 +7,50 @@ from app.core.feedback_manager import FeedbackManager
 from app.core.tenant_policy import TenantPurgeService
 from app.api.proxy import event_mesh
 from app.schemas.event_models import InvalidationScope
+from app.core.rehydrator import CacheRehydrator
+from app.core.snapshot import SnapshotCheckpointer
+
+snapshot_checkpointer = SnapshotCheckpointer(cache.vector_store)
+cache_rehydrator = CacheRehydrator(cache.vector_store)
+
+
+@router.post("/cache/snapshot/export", status_code=status.HTTP_200_OK)
+def export_cache_snapshot(
+    min_hits: int = Body(default=1, embed=True),
+    tenant_id: Optional[str] = Body(default=None, embed=True),
+    filename: Optional[str] = Body(default=None, embed=True),
+):
+    """Exports active cache entries into a compressed snapshot archive."""
+    filepath, count = snapshot_checkpointer.export_snapshot(
+        min_hits=min_hits, filename=filename, tenant_id=tenant_id
+    )
+    return {
+        "status": "success",
+        "snapshot_path": filepath,
+        "exported_records": count,
+    }
+
+
+@router.post("/cache/snapshot/import", status_code=status.HTTP_200_OK)
+async def import_cache_snapshot(
+    filepath: str = Body(..., embed=True),
+    batch_size: int = Body(default=250, embed=True),
+):
+    """Rehydrates L1 and L2 caches asynchronously from a snapshot archive."""
+    if not os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Snapshot file not found: {filepath}",
+        )
+
+    success, failed = await cache_rehydrator.rehydrate_from_file(
+        filepath=filepath, batch_size=batch_size
+    )
+    return {
+        "status": "completed",
+        "successfully_rehydrated": success,
+        "failed_records": failed,
+    }
 
 
 @router.delete("/cache/tenants/{tenant_id}", status_code=status.HTTP_200_OK)
