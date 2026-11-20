@@ -92,6 +92,33 @@ class CacheWriter:
 
         if self.store.index and self.store.client:
             from app.core.cache_reader import CacheReader
+            from app.core.cluster_centroid import ClusterCentroidManager
+
+            reader = CacheReader(self.store)
+            near_duplicate = reader.query_similarity(
+                vector=vector,
+                model=model,
+                system_prompt_hash=system_prompt_hash,
+                params_hash=params_hash,
+                context_hash=context_hash,
+                tenant_id=tenant_id,
+                similarity_threshold=self.DEDUPLICATION_THRESHOLD,
+            )
+
+            if near_duplicate:
+                _, _, existing_key = near_duplicate
+                # Dynamically rebalance centroid toward incoming alias vector
+                centroid_manager = ClusterCentroidManager(self.store)
+                centroid_manager.update_cluster_centroid(
+                    entry_key=existing_key,
+                    incoming_vector=vector,
+                    alias_prompt=prompt,
+                )
+                self.store.client.expire(existing_key, ttl)
+                return existing_key
+
+        if self.store.index and self.store.client:
+            from app.core.cache_reader import CacheReader
             reader = CacheReader(self.store)
             near_duplicate = reader.query_similarity(
                 vector=vector,
@@ -131,3 +158,4 @@ class CacheWriter:
             self.store.client.expire(entry_key, ttl)
 
         return entry_key
+
