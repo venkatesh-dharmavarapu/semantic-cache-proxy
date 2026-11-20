@@ -9,6 +9,38 @@ from app.api.proxy import event_mesh
 from app.schemas.event_models import InvalidationScope
 from app.core.rehydrator import CacheRehydrator
 from app.core.snapshot import SnapshotCheckpointer
+from app.core.cluster_centroid import ClusterCentroidManager
+
+centroid_manager = ClusterCentroidManager(cache.vector_store)
+
+
+@router.get("/cache/clusters/{entry_id}/aliases", status_code=status.HTTP_200_OK)
+def get_cluster_alias_history(entry_id: str):
+    """Returns the set of recorded query aliases that merged into a canonical cluster centroid."""
+    # Handle optional prefix if omitted
+    key = entry_id if entry_id.startswith("cache:llm:") else f"cache:llm:{entry_id}"
+    aliases = centroid_manager.get_cluster_aliases(key)
+    client = cache.vector_store.client
+
+    alias_count = 0
+    hit_count = 0
+    prompt = ""
+    if client:
+        raw_count = client.hget(key, "alias_count")
+        raw_hits = client.hget(key, "hit_count")
+        raw_prompt = client.hget(key, "prompt")
+        alias_count = int(raw_count) if raw_count else 0
+        hit_count = int(raw_hits) if raw_hits else 0
+        prompt = raw_prompt.decode("utf-8") if raw_prompt else ""
+
+    return {
+        "cluster_key": key,
+        "canonical_prompt": prompt,
+        "total_aliases_recorded": len(aliases),
+        "alias_count": alias_count,
+        "hit_count": hit_count,
+        "aliases": aliases,
+    }
 
 snapshot_checkpointer = SnapshotCheckpointer(cache.vector_store)
 cache_rehydrator = CacheRehydrator(cache.vector_store)
