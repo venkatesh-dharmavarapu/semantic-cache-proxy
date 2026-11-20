@@ -29,6 +29,11 @@ from app.core.tracer import W3CTraceContext
 import asyncio
 from app.core.mutex_lease import MutexLeaseManager
 from app.core.xfetch import XFetchEngine
+# Add import
+from app.core.cluster_centroid import ClusterCentroidManager
+
+centroid_manager = ClusterCentroidManager(cache.vector_store)
+
 from app.services.fallback_dispatcher import (
     UpstreamFallbackDispatcher,
     UpstreamServiceUnavailableError,
@@ -175,6 +180,30 @@ async def chat_completions(
     if was_compacted:
         response.headers["X-Context-Compacted"] = "true"
         response.headers["X-Tokens-Compacted"] = str(tokens_saved)
+
+    if match:
+        resp_data, similarity_score, entry_key = match
+        total_lat = profiler.total_elapsed_ms()
+        telemetry.record_hit(latency_ms=total_lat)
+        sla_tracker.record_latency(is_hit=True, latency_ms=total_lat)
+
+        from app.api.admin import drift_tracker
+        drift_tracker.record_hit_similarity(similarity_score)
+
+        cache.reader.extend_key_ttl(entry_key, extension_seconds=tenant_cfg.max_ttl_seconds)
+        exact_cache.store_exact(exact_key, resp_data, ttl_seconds=tenant_cfg.max_ttl_seconds)
+
+        # If match is an alias (similarity between threshold and 0.98), rebalance centroid
+        if similarity_score < 0.98:
+            centroid_manager.update_cluster_centroid(
+                entry_key=entry_key,
+                incoming_vector=vector,
+                alias_prompt=user_prompt,
+            )
+
+        if x_session_id and x_turn_index is not None:
+            session_manager.record_turn(x_session_id, x_turn_index, entry_key)
+        ...
 
     # 3. Explicit Cache Bypass
     if x_cache_bypass:
