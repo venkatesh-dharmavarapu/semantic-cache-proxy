@@ -31,6 +31,10 @@ from app.core.mutex_lease import MutexLeaseManager
 from app.core.xfetch import XFetchEngine
 from app.core.hedger import RequestHedger
 request_hedger = RequestHedger(default_hedge_delay_ms=650.0)
+# Add import
+from app.core.singleflight import SingleFlightCoordinator
+
+singleflight_coordinator = SingleFlightCoordinator()
 from app.core.cluster_centroid import ClusterCentroidManager
 
 centroid_manager = ClusterCentroidManager(cache.vector_store)
