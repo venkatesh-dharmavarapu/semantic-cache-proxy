@@ -144,6 +144,7 @@ class CacheWriter:
             "params_hash": params_hash,
             "context_hash": context_hash,
             "tenant_id": tenant_id,
+            "schema_hash": schema_hash,
             "created_at": now,
             "ttl": ttl,
             "hit_count": 0,
