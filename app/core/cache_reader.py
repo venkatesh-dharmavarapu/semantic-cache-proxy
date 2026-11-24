@@ -167,3 +167,13 @@ class CacheReader:
             f"(@tenant_id:{{{clean_tenant}}})"
         )
         # Remaining logic follows stage 1 search and cross-encoder verification...
+
+        clean_schema = escape_redis_tag(schema_hash)
+        filter_expression = (
+            f"(@model:{{{clean_model}}}) & "
+            f"(@system_prompt_hash:{{{clean_sys}}}) & "
+            f"(@params_hash:{{{clean_params}}}) & "
+            f"(@context_hash:{{{clean_ctx}}}) & "
+            f"(@tenant_id:{{{clean_tenant}}}) & "
+            f"(@schema_hash:{{{clean_schema}}})"
+        )
