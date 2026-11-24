@@ -28,6 +28,21 @@ class ExactMatchCache:
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         return f"{cls.PREFIX}{tenant_id}:{digest}"
 
+    @classmethod
+    def generate_exact_key(
+        cls,
+        prompt: str,
+        model: str,
+        system_prompt_hash: str,
+        params_hash: str,
+        context_hash: str = "stateless",
+        tenant_id: str = "default",
+        schema_hash: str = "unstructured",
+    ) -> str:
+        normalized = f"{tenant_id}::{model.strip().lower()}::{system_prompt_hash}::{params_hash}::{context_hash}::{schema_hash}::{prompt.strip()}"
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return f"{cls.PREFIX}{tenant_id}:{digest}"
+
     def lookup(self, exact_key: str) -> Optional[Tuple[Dict[str, Any], float, float]]:
         """
         Retrieves cached response along with XFetch metadata.
