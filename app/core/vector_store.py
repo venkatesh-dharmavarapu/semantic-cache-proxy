@@ -45,6 +45,7 @@ class VectorStoreManager:
                 {"name": "params_hash", "type": "tag"},
                 {"name": "context_hash", "type": "tag"},
                 {"name": "tenant_id", "type": "tag"},
+                {"name": "schema_hash", "type": "tag"},
                 {"name": "created_at", "type": "numeric"},
                 {"name": "ttl", "type": "numeric"},
                 {"name": "hit_count", "type": "numeric"},
