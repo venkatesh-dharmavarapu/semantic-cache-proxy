@@ -36,6 +36,7 @@ request_hedger = RequestHedger(default_hedge_delay_ms=650.0)
 from app.core.singleflight import SingleFlightCoordinator
 
 singleflight_coordinator = SingleFlightCoordinator()
+from app.core.differential_engine import DifferentialEngine, SchemaHasher
 from app.core.cluster_centroid import ClusterCentroidManager
 
 centroid_manager = ClusterCentroidManager(cache.vector_store)
@@ -303,6 +304,52 @@ async def chat_completions(
         response.headers["X-Lookup-Latency-ms"] = f"{total_lat:.2f}"
         response.headers["Server-Timing"] = profiler.to_server_timing_header()
         return l1_cached
+
+    # Extract structured output schema constraints
+    req_dict = request.model_dump(exclude_none=True)
+    schema_hash = SchemaHasher.hash_response_format(
+        response_format=req_dict.get("response_format"),
+        tools=req_dict.get("tools"),
+    )
+    response.headers["X-Schema-Hash"] = schema_hash
+
+    # Pass schema_hash to exact key generation
+    exact_key = ExactMatchCache.generate_exact_key(
+        prompt=user_prompt,
+        model=request.model,
+        system_prompt_hash=sys_hash,
+        params_hash=p_hash,
+        context_hash=c_hash,
+        tenant_id=x_tenant_id,
+        schema_hash=schema_hash,
+    )
+
+    # Pass schema_hash to L2 semantic query
+    match = cache.reader.query_similarity(
+        vector=vector,
+        model=request.model,
+        system_prompt_hash=sys_hash,
+        params_hash=p_hash,
+        context_hash=c_hash,
+        tenant_id=x_tenant_id,
+        schema_hash=schema_hash,
+        similarity_threshold=active_threshold,
+        raw_prompt=user_prompt,
+    )
+
+    # Pass schema_hash to cache.store on cache misses
+    cache.store(
+        prompt=user_prompt,
+        vector=vector,
+        response_data=raw_resp,
+        model=request.model,
+        system_prompt_hash=sys_hash,
+        params_hash=p_hash,
+        context_hash=c_hash,
+        tenant_id=x_tenant_id,
+        schema_hash=schema_hash,
+        ttl_seconds=ttl,
+    )
 
     # 5. L2 SEMANTIC VECTOR CACHE (Tenant Filtered)
     profiler.start("l2_semantic")
