@@ -10,6 +10,59 @@ from app.schemas.event_models import InvalidationScope
 from app.core.rehydrator import CacheRehydrator
 from app.core.snapshot import SnapshotCheckpointer
 from app.core.cluster_centroid import ClusterCentroidManager
+from app.core.semantic_invalidator import SemanticInvalidator
+from app.schemas.event_models import InvalidationScope
+
+semantic_invalidator = SemanticInvalidator(cache.vector_store)
+
+
+@router.post("/cache/invalidate/semantic", status_code=status.HTTP_200_OK)
+async def invalidate_semantic_range(
+    prompt: str = Body(..., embed=True, description="Seed prompt representing content to invalidate"),
+    distance_threshold: float = Body(default=0.12, embed=True, description="Max cosine distance radius (0.01 - 0.25)"),
+    tenant_id: Optional[str] = Body(default=None, embed=True),
+    max_limit: int = Body(default=50, embed=True),
+    dry_run: bool = Body(default=False, embed=True, description="If true, previews matches without deleting"),
+):
+    """
+    Invalidates all cached entries within semantic proximity of a seed prompt.
+    Clears both L1 exact and L2 vector entries across the cluster.
+    """
+    seed_vector = await cache.embedder.get_embedding(prompt)
+
+    evicted_count, matched = semantic_invalidator.evict_semantic_range(
+        seed_vector=seed_vector,
+        distance_threshold=distance_threshold,
+        tenant_id=tenant_id,
+        max_limit=max_limit,
+        dry_run=dry_run,
+    )
+
+    if not dry_run and evicted_count > 0:
+        # Broadcast invalidation event to cluster mesh
+        await event_mesh.publish_event(
+            scope=InvalidationScope.KEY_EVICTED,
+            target=f"semantic_sweep:{tenant_id or 'all'}",
+            metadata={"seed_prompt": prompt, "evicted_count": evicted_count},
+        )
+
+    return {
+        "status": "preview" if dry_run else "success",
+        "dry_run": dry_run,
+        "seed_prompt": prompt,
+        "distance_threshold": distance_threshold,
+        "evicted_count": evicted_count,
+        "matched_count": len(matched),
+        "matched_entries": [
+            {
+                "key": m.get("id") or m.get("key"),
+                "prompt": m.get("prompt"),
+                "distance": float(m.get("vector_distance", 0.0)),
+                "tenant_id": m.get("tenant_id"),
+            }
+            for m in matched
+        ],
+    }
 
 centroid_manager = ClusterCentroidManager(cache.vector_store)
 
