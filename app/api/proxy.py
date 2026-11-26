@@ -36,6 +36,8 @@ request_hedger = RequestHedger(default_hedge_delay_ms=650.0)
 from app.core.singleflight import SingleFlightCoordinator
 
 singleflight_coordinator = SingleFlightCoordinator()
+from fastapi.responses import StreamingResponse
+from app.core.streaming_pipe import StreamingTeePipe
 from app.core.differential_engine import DifferentialEngine, SchemaHasher
 from app.core.cluster_centroid import ClusterCentroidManager
 
