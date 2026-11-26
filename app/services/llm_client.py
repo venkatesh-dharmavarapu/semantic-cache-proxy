@@ -140,3 +140,20 @@ class LLMClient:
             response = await client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             return response.json()
+
+    async def forward_chat_completion_stream(
+        self,
+        payload: Dict[str, Any],
+        traceparent: Optional[str] = None,
+    ):
+        """Dispatches streaming request upstream, yielding the raw httpx streaming response."""
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if traceparent:
+            headers["traceparent"] = traceparent
+
+        client = httpx.AsyncClient(timeout=self.timeout)
+        req = client.build_request("POST", url, json=payload, headers=headers)
+        res = await client.send(req, stream=True)
+        res.raise_for_status()
+        return res, client
