@@ -46,6 +46,8 @@ class VectorStoreManager:
                 {"name": "context_hash", "type": "tag"},
                 {"name": "tenant_id", "type": "tag"},
                 {"name": "schema_hash", "type": "tag"},
+                {"name": "is_multimodal", "type": "tag"},
+                {"name": "image_hash", "type": "tag"},
                 {"name": "created_at", "type": "numeric"},
                 {"name": "ttl", "type": "numeric"},
                 {"name": "hit_count", "type": "numeric"},
