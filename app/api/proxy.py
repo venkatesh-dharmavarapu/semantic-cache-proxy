@@ -34,6 +34,7 @@ from app.core.hedger import RequestHedger
 request_hedger = RequestHedger(default_hedge_delay_ms=650.0)
 # Add import
 from app.core.singleflight import SingleFlightCoordinator
+from app.core.multimodal_hasher import PerceptualImageHasher
 
 singleflight_coordinator = SingleFlightCoordinator()
 from fastapi.responses import StreamingResponse
