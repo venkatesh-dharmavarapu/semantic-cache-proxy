@@ -39,12 +39,17 @@ class CacheReader:
         clean_sys = escape_redis_tag(system_prompt_hash)
         clean_params = escape_redis_tag(params_hash)
         clean_ctx = escape_redis_tag(context_hash)
-
+        clean_mm = "true" if is_multimodal else "false"
+        clean_img = escape_redis_tag(image_hash)
         filter_expression = (
             f"(@model:{{{clean_model}}}) & "
             f"(@system_prompt_hash:{{{clean_sys}}}) & "
             f"(@params_hash:{{{clean_params}}}) & "
-            f"(@context_hash:{{{clean_ctx}}})"
+            f"(@context_hash:{{{clean_ctx}}}) & "
+            f"(@tenant_id:{{{clean_tenant}}}) & "
+            f"(@schema_hash:{{{clean_schema}}}) & "
+            f"(@is_multimodal:{{{clean_mm}}}) & "
+            f"(@image_hash:{{{clean_img}}})"
         )
 
         dense_results: List[Dict[str, Any]] = []
